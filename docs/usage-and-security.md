@@ -39,7 +39,7 @@
 | 图片2~8 | `image[]` | — | 可选 | 追加参考图(最多 8) |
 | 遮罩 | `mask` | — | 可选 | `MASK`;透明(选中)区域被编辑,alpha=(1-mask)*255 |
 | 输入保真度 | `input_fidelity` | — | 可选 | `default`/`low`/`high`;**仅编辑端点**。`gpt-image-2` 忽略(恒为 high),`gpt-image-1.x` 生效 |
-| 数量 | `n` | ✅ | ✅ | 1~10,默认 1 |
+| 数量 | `n` | ✅ | ✅ | 0~10,**默认 0 = 不发送该字段**(由服务端定,通常 1;字段越少越不容易被挑剔的网关拒掉);要一次多张就填 2~10。遇网关错判 `n` 类型时保持 0(见本节末) |
 | 质量 | `quality` | ✅ | ✅ | `default`/`auto`/`high`/`medium`/`low` |
 | 背景 | `background` | ✅ | ✅ | `default`/`auto`/`transparent`/`opaque` |
 | 输出格式 | `output_format` | ✅ | ✅ | `default`/`png`/`jpeg`/`webp` |
@@ -50,7 +50,25 @@
 | 超时秒数 | (读取超时) | ✅ | ✅ | 默认 900(15min),上限 3600;采用 (连接15s, 读取N秒) 元组 |
 | 重试次数 | (客户端重试) | ✅ | ✅ | 0~5,默认 2;瞬时错误(429/5xx/超时/连接重置)自动重试(见第 5 节) |
 
-> **`default` 档 = 不发送该字段**,让服务端用其默认值。这样面对不支持某字段的 OpenAI 兼容网关时不会因未知参数报 400。`output_compression` 还额外要求 `output_format` 为 jpeg/webp 才发送。`stream`/`partial_images` 仅在勾选「流式」时才发送。`input_fidelity` 仅编辑端点发送。
+> **`default` 档 = 不发送该字段**,让服务端用其默认值。这样面对不支持某字段的 OpenAI 兼容网关时不会因未知参数报 400。`output_compression` 还额外要求 `output_format` 为 jpeg/webp 才发送。`stream`/`partial_images` 仅在勾选「流式」时才发送。`input_fidelity` 仅编辑端点发送。`n` 亦沿用此约定:`数量=0` 时整字段不发。
+
+### ⚠️ 两个端点的参数编码不同(常见 400 根源)
+
+同一个参数在两个端点上「长得不一样」,这是 HTTP 协议决定的,不是插件的选择:
+
+| | 文生图 `/images/generations` | 图生图 `/images/edits` |
+|---|---|---|
+| 编码 | `application/json` | `multipart/form-data` |
+| `n=1` 实际发出 | `{"n": 1}` —— **真正的整数类型** | 表单字段 `n=1` —— **只能是字符串**,multipart 没有数字类型 |
+| 服务端 | 直接拿到 int | 必须自己把 `"1"` 解析回 int |
+
+因此**编辑端点更容易踩到网关的类型校验 bug**:若网关对 `n` 做整数强校验却没做字符串转换,就会回 `400 INVALID_PARAM: n 必须是 … 整数`,而同一网关的文生图完全正常。
+
+插件侧已做到位(`api_client._form_value`):multipart 字段值统一给出「最无争议的写法」——int 输出纯十进制数字(不会是 `1.0`)、bool 输出小写 `true`/`false`(不会是 python 的 `True`);`n` 在 `build_params` 里先经 `_coerce_int` 收口成真 int 再编码。
+
+**但 multipart 无法送出「真正的整数」——那是协议决定的。** 所以 v3.5.0 把「数量」的默认值改为 **0 = 整字段不发送**(与本插件枚举参数的 `default` 档同一套约定):不发 `n`,服务端就用自己的默认值(通常 1),这类网关 bug 自然绕开。
+
+> ⚠️ **已存工作流不会自动跟进**:widget 默认值只作用于**新建节点**;旧工作流里存的还是原来的 `1`。若你正被此问题卡住,请把该节点的「数量」手动改成 0(或删掉重建节点)。
 
 ### 参数×模型联动校验(发请求前)
 
@@ -75,7 +93,7 @@
 - **无预设网关**:代码中不含任何写死的域名,一切请求发往你在配置节点填写的 `base_url`。
 - **无第三方图床**:参考图直接以 `image[]` multipart 发往 `{base_url}/images/edits`,不经中转。
 - **无遥测 / 上报**:没有 telemetry / analytics / beacon / sentry,也没有 `eval` / `exec` / `subprocess` / `socket` 等隐蔽执行或网络逃逸。
-- **密钥只出现在请求头**:`Authorization: Bearer <key>`,绝不写进任何日志。错误日志只截取服务端响应体前若干字符,且不含密钥。
+- **密钥只出现在请求头**:`Authorization: Bearer <key>`,绝不写进任何日志。上游报错时,插件会把**响应正文**提炼成摘要放进异常、并把完整正文打进 ComfyUI 控制台日志(见第 9 节);正文来自你自己的网关,不含密钥。
 - **密钥不写进工作流**:前端扩展 (`web/gpt_image_config_security.js`) 把配置节点「密钥」widget 的 `serialize` 关闭,使 `api_key` 不进 `widgets_values`。
 
 ### ✅ 密钥泄露已修复(v3.4.0)
@@ -84,9 +102,23 @@
 - **关键约束**:ComfyUI 里「保存(Ctrl+S)」「导出」「输出图内嵌 workflow」三者都走同一个 `graph.serialize()`,前端**没有**可靠的「只在导出时剔除、保存时保留」钩子。故不去区分保存/导出,而是双管齐下(见下)。
 - **修复原理**:ComfyUI 前端把「执行」与「持久化」分成两条独立路径——执行 (`graphToPrompt`) 读 widget 实时值发给后端、只在 `widget.options.serialize === false` 时跳过;持久化 (`LGraphNode.serialize`) 生成 `widgets_values`、在 `widget.serialize === false` 时跳过。
   1. 前端扩展对密钥 widget 设 `widget.serialize = false`(注意是 widget 自身属性,不是 `options.serialize`):密钥**照常参与执行**(后端仍拿得到 key),但**永不写进** `widgets_values`——任何序列化产物(本地保存的 `.json`、导出、PNG 内嵌)都不含它。
-  2. 密钥单独按 `base_url` 存进浏览器 **localStorage**:载入工作流 / 改地址时自动回填,**本机重开无需重填**;但它不进工作流 JSON,分享给别人时对方拿不到。
+  2. 密钥单独存进浏览器 **localStorage**,**按配置节点各自归档**:载入工作流 / 改地址时自动回填,**本机重开无需重填**;但它不进工作流 JSON,分享给别人时对方拿不到。
 - **索引安全**:密钥是配置节点最后一个 widget(`接口地址` 在前且照常保存),`configure()` 按 `serialize !== false` 过滤后定位,不会串位;旧的、已含 key 的工作流载入后其明文 key 会被丢弃、改由 localStorage 存档回填。
-- **多网关友好**:localStorage 按归一化后的 `base_url` 归档(去空白/末尾斜杠,与后端 `build` 一致),不同网关各存各的密钥;不依赖 ComfyUI 节点 id(id 会跨工作流碰撞,见第 6 节)。
+  > ⚠️ **给改动此节点的人**:ComfyUI 前端的两个方向**不对称**——`serialize()` 写 `widgets_values[i]` 用的是 widget 的**原始下标**(跳过 `serialize===false` 的项、留空位),而 `configure()` 读取时用的是**压缩计数器**(只数 `serialize!==false` 的项)。两者仅在「所有 `serialize:false` 的 widget 都排在最后」时才一致。密钥现在恰好是最后一个,所以安全;**若要新增 widget,必须加在「密钥」之前**(即 `INPUT_TYPES` 里声明在 `密钥` 前面),否则新 widget 会读到错位的值。
+
+### ✅ 多个配置节点互相覆盖已修复(v3.5.0)
+
+- **原问题**:v3.4.1 及以前,localStorage 存档**按 `base_url` 归档**(键 = 前缀 + `base_url`),那是**所有配置节点共享的一格**。于是:
+  - 两个配置节点填同一个 `base_url`(例如同网关两个账号)时,**后改的密钥覆盖前一个的存档**;重开工作流两个节点都被回填成最后写入的那把密钥。
+  - **Clone / 复制粘贴节点后必然踩中**:副本继承同一个 `base_url`,所以副本上配置密钥就是往原节点那一格写——刷新后**原节点的密钥被换成副本的**(观感就是"配置好的密钥丢了")。连续 clone 三份再各配一把密钥,刷新后四个节点会**全变成最后写入的那一把**。
+  - **「先填密钥、后填地址」时密钥直接丢失**:存档键要用 `base_url` 算,地址还空着就算不出键,`saveKey` 静默 no-op;密钥又不进工作流,重开即没。
+- **修复原理**:每个配置节点在 `node.properties.gptImageConfigId` 里持有一个 uuid(litegraph 的 `properties` 会随工作流序列化、并在 `configure()` 里逐键还原,是 ComfyUI 给节点挂持久化附加状态的既有机制;**不用 `node.id`**——它跨工作流会碰撞,见第 6.3 节)。存档键 = 前缀 + uuid,**写入只碰自己那一格**,节点之间再不互相覆盖。
+- **回填优先级**:① 本节点自己的存档 → ② 同 `base_url` 下最近写入的存档(新建节点填个用过的地址即自动带出密钥,纯便利路径;**写入永远只写自己那格**,故不构成共享状态) → ③ v3.4.1 的旧版按-`base_url` 存档(**只读**,平滑迁移用,不再写入)。三者都**只在密钥 widget 为空时**才填,绝不覆盖手输值。用到 ②/③ 时会顺手落成本节点自己的存档,旧用户无感迁移。
+- **Clone / 粘贴一定是全新节点**:复制节点时 litegraph 会连 `properties` 一起克隆,副本因此继承同一个 uuid。故**写入前做去重**:发现与其它活节点撞号就给本节点换新 uuid,并继承一份原存档的副本(所以副本开箱即可用、值看起来一样),此后两者**各写各的格子**,互不影响。
+  > 两条路径的时序不同,都要照顾到:`LGraph.configure()`(载入工作流)与粘贴是**先把节点 add 进 graph、再逐个 `configure()`**;而 `LGraphNode.clone()`(菜单 Clone)是 **`createNode` → `configure()` → 由调用方 add**,即 `configure()` 时副本**还不在 graph 里**。去重同时挂在 `onConfigure` 与「写入前」两处,故两条路径都能覆盖。这些序列有 `test_web_config.mjs` 兜着(拿 v3.4.1 的实现跑会红 10 项)。
+- **已知边界**:去重只看**当前打开的这张图**。把整个工作流「另存为」或导出后再导入成第二个工作流时,两份里的节点 uuid 相同、会共用同一格存档——它们本就源自同一份配置(同地址同账号),共用通常正是想要的;若要它们彼此独立,在其中一个上重新填一次密钥前先删掉该节点重建。
+- **地址字段本就独立**:`接口地址` 是正常序列化的 widget,一直随工作流各存各的,不存在跨节点覆盖;但密钥被串改后节点的**实际生效配置**会跟着串,观感上就像「地址也被覆盖了」。
+
 
 ### ⚠️ 你仍需知道的残留风险
 
@@ -104,6 +136,7 @@
 2. **流式(官方保活机制,推荐)**:勾选「流式」→ 发送 `stream=true` + `partial_images`,服务端通过 SSE 分批推 `*.partial_image` 事件、最后 `*.completed` 带完整图。连接持续有数据流动,可越过中间代理的 idle timeout。插件解析:遍历 `data:` 行 JSON,按 `type` 取 `completed` 的 `b64_json`(取不到则用最后一个 partial 兜底)。**若响应 Content-Type 不是 `text/event-stream`(网关没按流式返回),自动回退普通 JSON 解析**,不会因开了流式而失败。
 3. **TCP keepalive**:共享 `requests.Session` 上启用 `SO_KEEPALIVE`(+ 平台相关 `TCP_KEEPIDLE/INTVL/CNT`),维持 NAT/防火墙映射。对 L7 负载均衡的应用层 idle timeout 无效。
 4. **瞬时错误重试(重试次数)**:遇 429/5xx/超时/连接重置时自动重试,**优先按服务端 `Retry-After` 头等待**,否则指数退避(`2^n` 秒,封顶 60s)。默认重试 2 次(总 3 次),0 关闭。**只重试「请求建立 + 首个状态码」阶段**——流式一旦开始迭代 SSE 就不再重试,避免半消费的流被重放;参考图以 bytes 传入,可安全跨重试重发。它兜的是"临时抖动",非法参数(400)不会重试。
+   > 可重试码除 `429/500/502/503/504` 外,还含 **`520~527`**——那是 Cloudflare 边缘自有的一段 5xx(`520: Web server is returning an unknown error`、`524: A timeout occurred` 等)。很多 OpenAI 兼容网关挂在 Cloudflare 后面,这段码表示**边缘到源站之间**出错,与本次请求参数无关,属典型瞬时故障。生图耗时长时尤其常见,建议同时开「流式」保活。
 
 > 端到端每层读超时都要 ≥ 生图时长。你能控本插件与自建网关;中间第三方 LB/nginx(`proxy_read_timeout` 等)不够大时,只有流式能保住连接。流式模式下多张(n>1)一般只回最终一张。
 
@@ -146,3 +179,35 @@ ComfyUI 的中断是**协作式轮询 (cooperative polling)**:点 Cancel 只是�
 ## 8. 命令行自测
 
 见 `test_api.py`(`--base` 与 `--key` 必填,无预设地址),支持 `--image`(可重复)、`--mask`、`--quality`、`--background`、`--output-format` 等,先验证服务端连通性再进 ComfyUI。
+
+另有两个不联网的单测:
+
+- `python test_validation.py` —— 参数×模型联动校验、重试判定、错误提炼等纯逻辑。
+- `node test_web_config.mjs` —— 配置节点前端扩展的无浏览器单测:用照抄前端产物语义的假 litegraph,驱动**真实的** `web/gpt_image_config_security.js` 跑「新建 / 先填密钥后填地址 / 两节点同地址 / **Clone** / 粘贴 / 连续 clone / 旧存档迁移 / 清空密钥」等序列。拿 v3.4.1 的旧实现跑会红 10 项(`GPTIMG_EXT=/tmp/old.js node test_web_config.mjs`),即这些用例确实咬得住上面那类 bug。
+
+## 9. 排查上游报错(错误信息怎么读)
+
+**v3.5.0 前的问题**:错误信息是 `响应正文[:500]`。网关挂在 Cloudflare 后面时正文是一整页 HTML,前 500 字全是 `<!DOCTYPE>`/IE 条件注释/`<meta>`,**唯一有用的那句话(`<title>` 里的 `520: Web server is returning an unknown error`)恰好被切在外面**;JSON 错误也可能因外层包裹而被截断。结果是「看到报错却没法排查」。
+
+**现在**每次非 200 都产出一条四段式信息(实现见 `api_client._http_error_message`):
+
+```
+[GPT-Image] edits 失败 (520 Origin Error): eaheng.com | 520: Web server is returning an unknown error | Error 520 …
+  诊断: url=https://api.example.com/v1/images/edits; content-type=text/html; cf-ray=9f2c…-HKG; server=cloudflare
+  本次发送: model='gpt-image-2', n='1', prompt='a cat…(共 239 字)', size='1024x1024'
+  提示: 520~527 是 Cloudflare 边缘码,表示边缘到你的网关源站之间出错…
+```
+
+| 段 | 内容 | 怎么用 |
+|---|------|--------|
+| 首行 | 状态码 + reason + **从正文提炼的关键信息** | JSON 取 `error.message`(附 `code`/`type`);HTML 取 `<title>` + 去标签正文(剔除 `<script>`/`<style>`);其余按纯文本压空白 |
+| 诊断 | URL(**已剥掉 query**)、`Content-Type`、`cf-ray`/`x-request-id`/`server`/`retry-after` 等 | 找网关方报障时把追踪 id 直接贴给对方 |
+| 本次发送 | 本次实际发出的字段,**用 `repr` 打印** | 一眼区分 `n=1`(JSON 整数)与 `n='1'`(multipart 字符串),核对类型类 400 的根源(见第 3 节) |
+| 提示 | 按状态码给的下一步 | 401/403 鉴权、404 端点/`/v1`、400 参数、413 体积、429 限流、5xx 与 520~527 上游 |
+
+**完整正文不会丢**:摘要放进异常(避免整页 HTML 淹没 traceback),**完整响应正文打进 ComfyUI 控制台日志**(`[GPT-Image] … 上游完整响应正文 (N 字节)`)。异常框里看摘要,要看原始正文就翻控制台。
+
+**重试日志也带原因**:`第 1/3 次返回 520,2.0s 后重试。原因: …`,不再只有一个裸状态码。
+
+> 提示词长于 120 字会在「本次发送」里截断并标注总字数;密钥只在 `Authorization` 请求头里,**任何一段都不会出现密钥**。
+

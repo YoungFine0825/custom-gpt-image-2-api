@@ -26,6 +26,7 @@ data[].url (DALL-E 风格) 读取；流式结果从 *.completed 事件的 b64_js
 import base64
 import io
 import json
+import re
 import socket
 import threading
 import time
@@ -70,9 +71,19 @@ GPT_IMAGE_2_MAX_RATIO = 3.0
 ALLOWED_LEGACY_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 
 # 可重试的 HTTP 状态码：限流 + 常见网关/上游临时故障。
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# 520~527 是 Cloudflare 边缘自有的一段 5xx（"Web server is returning an unknown
+# error" / 源站超时等）。很多 OpenAI 兼容网关挂在 Cloudflare 后面，这段码表示
+# **边缘到源站之间**出了问题，与本次请求的参数无关，属于典型的瞬时故障，值得重试。
+RETRYABLE_STATUS = {429, 500, 502, 503, 504,
+                    520, 521, 522, 523, 524, 525, 526, 527}
 # 单次退避封顶(秒)，避免 Retry-After 过大时无谓长睡。
 MAX_BACKOFF = 60.0
+
+# 放进异常消息的上游正文上限。取 2000 而非 500：500 字连一页 Cloudflare 错误页的
+# <head> 都装不满，真正有用的 JSON error.message 常被切掉，导致「看到报错却无法排查」。
+# 同时错误正文会**完整**打进 ComfyUI 控制台日志（见 _http_error_message），
+# 异常框里只放提炼后的摘要，避免整页 HTML 淹没 traceback。
+MAX_ERROR_BODY = 2000
 
 # ComfyUI 中断机制 (interrupt)：懒加载，在 ComfyUI 外(单测/test_api 等独立运行)
 # 时 ImportError 降级为 None，_check_interrupt() 变成 no-op，不影响独立调用。
@@ -200,6 +211,42 @@ def mask_to_png_bytes(mask_tensor):
 
 def _clean(v):
     return str(v).strip() if v is not None else ""
+
+
+def _coerce_int(v):
+    """尽力把 v 转成 int；转不了返回 None（不抛，交给调用方决定怎么办）。
+
+    ComfyUI 的 INT widget 在部分前端版本会把值交成 float（1 -> 1.0），
+    甚至字符串（"1"）。这里统一收口成真正的 int，避免这类值一路带到请求里。
+    """
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return int(float(v)) if isinstance(v, str) else int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _form_value(v):
+    """把参数值转成 multipart 表单字段该有的字符串写法。
+
+    为什么需要它（两个端点的编码差异 / why this exists）：
+      - /images/generations 走 JSON，`{"n": 1}` 里的 1 是**真正的整数类型**；
+      - /images/edits 走 multipart/form-data，协议上**所有字段值都是字符串**，
+        没有数字类型可言。服务端必须自己把 "1" 解析回整数。
+    因此这一层要给出「最无争议的字符串写法」，不能直接用 python 的 str()：
+      - bool  -> "true"/"false"（str(True) 得到 "True"，多数网关不认）
+      - int   -> 十进制数字，无小数点
+      - float -> 整数值去掉 ".0"（str(1.0) 得到 "1.0"，严格按整数校验的网关
+                 会判成「不是整数」而回 400 INVALID_PARAM）
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return "%d" % v
+    if isinstance(v, float):
+        return "%d" % int(v) if v.is_integer() else repr(v)
+    return str(v)
 
 
 def _normalize_base_url(base_url):
@@ -354,14 +401,25 @@ def build_params(model, prompt, size="auto", n=1, quality="default",
                  input_fidelity="default"):
     """构造两个端点共用的参数字典。枚举取 "default" 时不发送该字段。
 
+    n（数量）沿用同一套「不发送」约定：n <= 0 或无法解析成整数时**不发送 n**，
+    由服务端用它自己的默认值（通常是 1）。这既符合本仓库「default 档 = 不发送
+    该字段」的设计不变量，也是遇到网关对 n 校验异常时的逃生口——个别 OpenAI
+    兼容网关在 multipart 的 /images/edits 上会错判 n（协议上 n 只能是字符串
+    "1"，网关若按整数强校验就会回 `INVALID_PARAM: n 必须是 … 整数`），
+    此时把「数量」设为 0 即可整字段不发。
+
     组装完成后调用 _validate 做参数×模型联动校验（单一校验入口）。
-    返回的是「标准 python 值」的 dict：generations 直接当 JSON body；
-    edits 会在 edit_images 里逐个转成字符串放进 multipart form。
+    返回的是「标准 python 值」的 dict：generations 直接当 JSON body（int 保持
+    int）；edits 会在 edit_images 里逐个经 _form_value 转成 multipart 字符串。
     """
     prompt = _clean(prompt)
     if not prompt:
         raise ValueError("[GPT-Image] 提示词(prompt) 为空。")
-    params = {"model": _clean(model) or "gpt-image-2", "prompt": prompt, "n": int(n)}
+    params = {"model": _clean(model) or "gpt-image-2", "prompt": prompt}
+
+    n_val = _coerce_int(n)
+    if n_val is not None and n_val > 0:
+        params["n"] = n_val
 
     size = _clean(size)
     if size:
@@ -380,10 +438,7 @@ def build_params(model, prompt, size="auto", n=1, quality="default",
 
     # output_compression 只在输出 jpeg/webp 时有意义。
     if params.get("output_format") in ("jpeg", "webp") and output_compression is not None:
-        try:
-            c = int(output_compression)
-        except (TypeError, ValueError):
-            c = None
+        c = _coerce_int(output_compression)
         if c is not None and 0 <= c <= 100:
             params["output_compression"] = c
 
@@ -398,7 +453,9 @@ def _images_from_response(resp_json, timeout):
     """
     data = (resp_json or {}).get("data") or []
     if not data:
-        raise RuntimeError("[GPT-Image] 响应里没有图片数据 (data 为空): %s" % str(resp_json)[:500])
+        # 200 但没有图：可能是网关把错误塞进了 200 响应，故沿用同一套提炼逻辑。
+        detail = _dig_error_message(resp_json) or _collapse(str(resp_json))[:MAX_ERROR_BODY]
+        raise RuntimeError("[GPT-Image] 响应里没有图片数据 (data 为空): %s" % detail)
     tensors = []
     for item in data:
         b64 = item.get("b64_json")
@@ -484,6 +541,183 @@ def _backoff_seconds(attempt):
     return min(MAX_BACKOFF, 2.0 ** attempt)
 
 
+# ── 上游错误的可读化 (making upstream errors diagnosable) ────────────────────
+# 背景：早先错误信息是 `r.text[:500]`。网关挂在 Cloudflare 后面时，正文是一整页
+# HTML 错误页，前 500 字全是 <!DOCTYPE>/条件注释/<meta>，真正有用的一句话
+# (标题里的 "520: Web server is returning an unknown error") 恰好被切在外面；
+# JSON 错误也可能因为前面裹了一层而被截断。结果是「有报错但没法排查」。
+# 现在：从正文里**提炼**关键信息(JSON 的 error.message / HTML 的 <title> + 正文
+# 文字)，附上响应侧诊断头与本次实际发送的字段，并把完整正文打进 ComfyUI 日志。
+
+_SCRIPT_RE = re.compile(r"(?is)<(script|style)\b.*?</\1\s*>")
+_TAG_RE = re.compile(r"(?s)<[^>]*>")
+_TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+# 排查时有用、且不含敏感信息的响应头（密钥只在请求头里，不会出现在响应里）。
+_DIAG_HEADERS = ("x-request-id", "request-id", "x-trace-id", "x-amzn-requestid",
+                 "cf-ray", "retry-after", "server", "date")
+
+
+def _collapse(s):
+    """把连续空白压成单个空格，便于单行展示。"""
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _looks_like_html(body, content_type):
+    head = body[:300].lstrip().lower()
+    return ("html" in (content_type or "").lower()
+            or head.startswith("<!doctype") or head.startswith("<html")
+            or "<html" in head)
+
+
+def _html_summary(html):
+    """HTML 错误页 -> 一行摘要：优先 <title>，再补正文可见文字。"""
+    title = ""
+    m = _TITLE_RE.search(html)
+    if m:
+        title = _collapse(_TAG_RE.sub("", m.group(1)))
+    text = _collapse(_TAG_RE.sub(" ", _SCRIPT_RE.sub(" ", html)))
+    if title:
+        # 正文往往以标题原文开头，去掉重复部分只留后续说明。
+        rest = text[len(title):] if text.startswith(title) else text
+        return _collapse(title + " | " + rest[:400]) if rest.strip() else title
+    return text[:400] or "(HTML 错误页，无可提取文字)"
+
+
+def _dig_error_message(obj):
+    """从常见的错误 JSON 形状里挖出人类可读的一句话。
+
+    覆盖 OpenAI 的 {"error": {"message", "code", "type"}}、各类兼容网关的
+    {"message"} / {"detail"} / {"msg"} / {"error": "..."} 等写法。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    if isinstance(err, dict):
+        msg = _clean(err.get("message") or err.get("msg") or err.get("detail"))
+        extra = [str(err[k]) for k in ("code", "type", "param") if err.get(k)]
+        if msg:
+            return msg + ("  [%s]" % ", ".join(extra) if extra else "")
+    elif isinstance(err, str) and err.strip():
+        return err.strip()
+    for key in ("message", "detail", "msg", "error_msg", "errorMessage"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _extract_error_message(body, content_type=""):
+    """上游错误正文 -> 提炼后的关键信息（JSON 消息 / HTML 摘要 / 纯文本）。"""
+    if not (body or "").strip():
+        return "(上游返回空正文)"
+    s = body.strip()
+    if s[:1] in ("{", "["):
+        try:
+            msg = _dig_error_message(json.loads(s))
+        except ValueError:
+            msg = ""
+        if msg:
+            return msg[:MAX_ERROR_BODY]
+    if _looks_like_html(s, content_type):
+        return _html_summary(s)[:MAX_ERROR_BODY]
+    return _collapse(s)[:MAX_ERROR_BODY]
+
+
+def _response_diag(resp):
+    """响应侧诊断串：去掉 query 的 URL + Content-Type + 可用于报障的追踪头。"""
+    bits = []
+    url = getattr(resp, "url", "") or ""
+    if url:
+        bits.append("url=" + url.split("?", 1)[0])
+    ctype = resp.headers.get("Content-Type")
+    if ctype:
+        bits.append("content-type=" + ctype)
+    for h in _DIAG_HEADERS:
+        val = resp.headers.get(h)
+        if val:
+            bits.append("%s=%s" % (h, val))
+    return "; ".join(bits)
+
+
+def _request_summary(req_kw):
+    """把「本次实际发出的字段」压成一行，便于核对参数类型与取值。
+
+    刻意用 repr 而非 str：这样 `n=1`（generations 的 JSON 整数）与 `n='1'`
+    （edits 的 multipart 字符串，协议决定的，见 _form_value）在日志里一眼可辨。
+    网关回「n 必须是整数」这类 400 时，这一行能直接确认我们究竟发了什么。
+    密钥只在 Authorization 请求头里，不会出现在这里。
+    """
+    src = req_kw.get("json")
+    if src is None:
+        src = req_kw.get("data")
+    parts = []
+    if isinstance(src, dict):
+        for k in sorted(src):
+            v = src[k]
+            if k == "prompt":
+                text = _clean(v)
+                v = text[:120] + ("…(共 %d 字)" % len(text) if len(text) > 120 else "")
+            parts.append("%s=%r" % (k, v))
+    # 只报 multipart 文件字段名与张数，不碰图片内容本身。
+    counts = {}
+    for item in req_kw.get("files") or []:
+        if isinstance(item, (tuple, list)) and item:
+            counts[item[0]] = counts.get(item[0], 0) + 1
+    if counts:
+        parts.append("files=" + "+".join("%s×%d" % kv for kv in sorted(counts.items())))
+    return ", ".join(parts)
+
+
+def _status_hint(code):
+    """按状态码给一句「下一步查哪里」的提示。"""
+    if code in (401, 403):
+        return "鉴权失败：检查「密钥」是否正确/已过期，以及该密钥在此网关是否有图像权限。"
+    if code == 404:
+        return ("端点不存在：检查「接口地址」是否漏了/多了 `/v1`（本插件会自行拼接 "
+                "`/images/generations` 与 `/images/edits`），以及该网关是否真的支持该端点。")
+    if code == 400:
+        return ("参数被上游拒绝：对照上面「本次发送」逐项核对。注意 edits 走 "
+                "multipart，协议上所有值都是字符串（如 n='1'）；若网关对某字段"
+                "强校验类型，可把对应参数设为 default/0 使其整字段不发送。")
+    if code == 413:
+        return "请求体过大：减少参考图数量或先缩小参考图尺寸。"
+    if code == 429:
+        return "被限流：降低并发或加大「重试次数」；插件会优先按响应的 Retry-After 等待。"
+    if 520 <= code <= 527:
+        return ("520~527 是 Cloudflare 边缘码，表示**边缘到你的网关源站之间**出错"
+                "（源站超时/崩溃/握手失败），不是本插件的参数问题。生图耗时长时尤其"
+                "常见：可开「流式」保活、加大「重试次数」，或联系网关方。")
+    if code in (500, 502, 503, 504):
+        return "网关/上游暂时不可用：通常重试即可；持续出现请联系网关方。"
+    return ""
+
+
+def _safe_body(resp):
+    try:
+        return resp.text or ""
+    except Exception as exc:                      # 正文读取本身也可能失败
+        return "<读取响应正文失败: %s>" % exc
+
+
+def _http_error_message(label, resp, req_kw=None):
+    """构造多行、可排查的错误信息；同时把完整正文打进 ComfyUI 日志。"""
+    body = _safe_body(resp)
+    short = _extract_error_message(body, resp.headers.get("Content-Type", ""))
+    reason = _clean(getattr(resp, "reason", "") or "")
+    lines = ["[GPT-Image] %s 失败 (%s%s): %s"
+             % (label, resp.status_code, " " + reason if reason else "", short)]
+    for tag, text in (("诊断", _response_diag(resp)),
+                      ("本次发送", _request_summary(req_kw or {})),
+                      ("提示", _status_hint(resp.status_code))):
+        if text:
+            lines.append("  %s: %s" % (tag, text))
+    # 摘要之外的内容不丢：完整正文进日志，异常框只留提炼后的摘要。
+    if _collapse(body) != short:
+        print("[GPT-Image] %s 上游完整响应正文 (%d 字节)：\n%s"
+              % (label, len(body), body))
+    return "\n".join(lines)
+
+
 def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw):
     """POST + 对瞬时错误(429/5xx/超时/连接重置)指数退避重试。
 
@@ -516,13 +750,15 @@ def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw
             if wait is None:
                 wait = _backoff_seconds(attempt)
             wait = min(MAX_BACKOFF, wait)
-            print("[GPT-Image] %s 第 %d/%d 次返回 %s，%.1fs 后重试。"
-                  % (label, attempt, attempts, r.status_code, wait))
+            # 日志里带上提炼后的原因，避免「重试了但不知道在重试什么」。
+            why = _extract_error_message(_safe_body(r), r.headers.get("Content-Type", ""))
+            print("[GPT-Image] %s 第 %d/%d 次返回 %s，%.1fs 后重试。原因: %s"
+                  % (label, attempt, attempts, r.status_code, wait, why[:200]))
             r.close()
             time.sleep(wait)
             continue
 
-        msg = "[GPT-Image] %s 失败 (%s): %s" % (label, r.status_code, r.text[:500])
+        msg = _http_error_message(label, r, req_kw)
         r.close()
         raise RuntimeError(msg)
 
@@ -538,7 +774,7 @@ def generate_images(base_url, api_key, params, timeout=900, stream=False,
     payload = dict(params)
     if stream:
         payload["stream"] = True
-        payload["partial_images"] = int(partial_images)
+        payload["partial_images"] = _coerce_int(partial_images) or 0
     r = _post_with_retry(base + "/images/generations", headers=headers, timeout=timeout,
                          stream=stream, attempts=attempts, label="generations", json=payload)
     return _stack(_result_tensors(r, timeout, stream))
@@ -551,11 +787,12 @@ def edit_images(base_url, api_key, params, ref_pngs, mask_png=None,
         raise ValueError("[GPT-Image] 编辑端点(/images/edits) 至少需要一张参考图，请连接「图片1」。")
     base = _normalize_base_url(base_url)
     headers = _auth_headers(api_key)  # 不设 Content-Type，交给 requests 生成 multipart 边界
-    # multipart 表单值必须是字符串。
-    form = {k: str(v) for k, v in params.items()}
+    # multipart 字段值在协议层只能是字符串，故逐个走 _form_value 给出规范写法
+    # （int 不带小数点、bool 用小写 true/false），不依赖 python 的 str()。
+    form = {k: _form_value(v) for k, v in params.items() if v is not None}
     if stream:
         form["stream"] = "true"
-        form["partial_images"] = str(int(partial_images))
+        form["partial_images"] = _form_value(_coerce_int(partial_images) or 0)
     # 多参考图通过重复的 image[] 字段传递 (OpenAI Images API 规范)。
     files = [("image[]", ("ref%d.png" % i, png, "image/png"))
              for i, png in enumerate(ref_pngs)]

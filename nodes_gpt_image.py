@@ -28,7 +28,12 @@ def _always_run(*args, **kwargs):
 def _common_optional():
     """两个节点共有的可选参数（枚举默认 default = 不发送，用服务端默认）。"""
     return {
-        "数量": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
+        # 数量 n：默认 0 = 不发送该字段(服务端定，通常 1)，沿用本插件「default 档 =
+        # 不发送」的兼容性约定——字段越少，越不容易被挑剔的兼容网关拒掉；这也绕开
+        # 了个别网关在 multipart 上错判 n 类型的 bug(见 api_client._form_value)。
+        "数量": ("INT", {"default": 0, "min": 0, "max": 10, "step": 1,
+                       "tooltip": "一次生成几张。0 = 不发送 n 字段，由服务端定(通常 1)，兼容性最好；"
+                                  "要一次多张就填 2~10。若网关报 `n 必须是…整数` 之类的 400，保持 0。"}),
         "质量": (api_client.QUALITY_OPTIONS, {"default": "default"}),
         "背景": (api_client.BACKGROUND_OPTIONS, {"default": "default"}),
         "输出格式": (api_client.OUTPUT_FORMAT_OPTIONS, {"default": "default"}),
@@ -81,7 +86,7 @@ class GPTImageGenerate:
             model=kw.get("模型", "gpt-image-2"),
             prompt=kw.get("提示词", ""),
             size=api_client.size_from_wh(kw.get("宽"), kw.get("高")),
-            n=kw.get("数量", 1),
+            n=kw.get("数量", 0),          # 缺省与 widget 默认一致：0 = 不发送 n
             quality=kw.get("质量", "default"),
             background=kw.get("背景", "default"),
             output_format=kw.get("输出格式", "default"),
@@ -143,7 +148,7 @@ class GPTImageEdit:
             model=kw.get("模型", "gpt-image-2"),
             prompt=kw.get("提示词", ""),
             size=api_client.size_from_wh(kw.get("宽"), kw.get("高")),
-            n=kw.get("数量", 1),
+            n=kw.get("数量", 0),          # 缺省与 widget 默认一致：0 = 不发送 n
             quality=kw.get("质量", "default"),
             background=kw.get("背景", "default"),
             output_format=kw.get("输出格式", "default"),

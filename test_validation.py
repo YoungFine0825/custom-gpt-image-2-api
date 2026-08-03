@@ -86,6 +86,125 @@ def main():
     assert ac._retry_after_seconds(_Resp(None)) is None
     assert ac._retry_after_seconds(_Resp("Wed, 21 Oct 2099 07:28:00 GMT")) is None  # HTTP-date 不解析
     assert 429 in ac.RETRYABLE_STATUS and 400 not in ac.RETRYABLE_STATUS
+    # Cloudflare 边缘 5xx(520~527) 属瞬时故障，应重试
+    assert 520 in ac.RETRYABLE_STATUS and 524 in ac.RETRYABLE_STATUS
+
+    # ── n(数量) 参数：>0 才发送，<=0 / 非法 -> 整字段不发 ──
+    assert expect_ok("gpt-image-2", n=1).get("n") == 1
+    assert expect_ok("gpt-image-2", n=4).get("n") == 4
+    assert "n" not in expect_ok("gpt-image-2", n=0)          # 0 = 不发送(逃生口)
+    assert "n" not in expect_ok("gpt-image-2", n=-1)
+    assert "n" not in expect_ok("gpt-image-2", n="abc")       # 解析不了 -> 不发送
+    assert expect_ok("gpt-image-2", n="3").get("n") == 3      # 字符串数字收口成 int
+    assert expect_ok("gpt-image-2", n=2.0).get("n") == 2      # float -> int
+    # 发送的必须是真 int，否则 JSON body 里会变成 "3"/3.0
+    assert isinstance(expect_ok("gpt-image-2", n=2.0)["n"], int)
+
+    # ── _coerce_int ──
+    assert ac._coerce_int(3) == 3
+    assert ac._coerce_int("3") == 3
+    assert ac._coerce_int(3.0) == 3
+    assert ac._coerce_int(None) is None
+    assert ac._coerce_int(True) is None      # bool 不当数字用
+    assert ac._coerce_int("x") is None
+
+    # ── _form_value：multipart 字段值的规范写法（协议上只能是字符串）──
+    assert ac._form_value(1) == "1"
+    assert ac._form_value(1.0) == "1"        # 不能是 "1.0"，严格网关会判成非整数
+    assert ac._form_value(True) == "true"    # 不能是 "True"
+    assert ac._form_value(False) == "false"
+    assert ac._form_value("auto") == "auto"
+
+    # ── 错误正文提炼（修复「上游报错被截断到 500 字、看不到原因」）──
+    # OpenAI 风格 JSON：挖出 error.message，并带上 code/type
+    msg = ac._extract_error_message(
+        '{"error":{"code":"INVALID_PARAM","message":"n 必须是 1 到 128 的整数",'
+        '"type":"invalid_request_error"}}', "application/json")
+    assert "n 必须是 1 到 128 的整数" in msg and "INVALID_PARAM" in msg
+    # 兼容网关的其它形状
+    assert "boom" in ac._extract_error_message('{"message":"boom"}', "application/json")
+    assert "bad" in ac._extract_error_message('{"error":"bad"}', "application/json")
+    assert "d1" in ac._extract_error_message('{"detail":"d1"}', "application/json")
+    # Cloudflare HTML 错误页：关键信息在 <title> 里，旧实现会被前 500 字的
+    # DOCTYPE/条件注释/meta 挤掉，这里必须能提出来。
+    html = ("<!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6\"> <![endif]-->\n"
+            + "<!-- %s -->\n" % ("x" * 600)
+            + "<head>\n<title>eaheng.com | 520: Web server is returning an unknown error"
+              "</title>\n<meta charset=\"UTF-8\" />\n<style>.a{color:red}</style>\n</head>"
+              "<body><h1>Error 520</h1></body></html>")
+    got = ac._extract_error_message(html, "text/html; charset=UTF-8")
+    assert "520" in got and "unknown error" in got, got
+    assert "DOCTYPE" not in got and "<meta" not in got, got   # 标签/样板被剔除
+    assert "color:red" not in got, got                       # <style> 内容不进摘要
+    assert len(got) <= ac.MAX_ERROR_BODY
+    # 空正文与纯文本
+    assert "空正文" in ac._extract_error_message("", "text/plain")
+    assert ac._extract_error_message("  plain  boom \n", "text/plain") == "plain boom"
+
+    # ── 请求字段摘要：用 repr 区分 n=1(JSON int) 与 n='1'(multipart str) ──
+    assert "n=1" in ac._request_summary({"json": {"n": 1, "prompt": "p"}})
+    assert "n='1'" in ac._request_summary({"data": {"n": "1", "prompt": "p"}})
+    long_prompt = "字" * 300
+    summary = ac._request_summary({"json": {"prompt": long_prompt}})
+    assert "共 300 字" in summary and len(summary) < 300   # 长提示词被截断
+    assert ac._request_summary({}) == ""
+    # multipart 只报文件字段名与张数（不碰图片内容）
+    files = [("image[]", ("a.png", b"x", "image/png")),
+             ("image[]", ("b.png", b"y", "image/png")),
+             ("mask", ("m.png", b"z", "image/png"))]
+    fs = ac._request_summary({"data": {"n": "1"}, "files": files})
+    assert "image[]×2" in fs and "mask×1" in fs, fs
+
+    # ── 状态码提示 ──
+    assert ac._status_hint(520) and "Cloudflare" in ac._status_hint(520)
+    assert ac._status_hint(524) and ac._status_hint(401) and ac._status_hint(400)
+    assert ac._status_hint(200) == ""
+
+    # ── 错误信息组装：状态码 + 摘要 + 诊断头 + 本次发送 + 提示 ──
+    class _HttpResp:
+        status_code = 520
+        reason = "Origin Error"
+        url = "https://gw.example.com/v1/images/edits?trace=1"
+        headers = {"Content-Type": "text/plain", "cf-ray": "8ab-HKG",
+                   "server": "cloudflare"}
+        text = "boom"
+
+    built = ac._http_error_message("edits", _HttpResp(), {"data": {"n": "1"}})
+    assert "(520 Origin Error)" in built and "boom" in built
+    assert "cf-ray=8ab-HKG" in built                 # 报障用的追踪头
+    assert "trace=1" not in built                    # query 被剥掉，不外泄
+    assert "n='1'" in built                          # 实际发出的值与类型
+    assert "Cloudflare" in built                     # 状态码提示
+
+    # ── 端到端：edits 的 multipart 表单值都是「规范字符串」，n 可整字段不发 ──
+    orig_post = ac._post_with_retry
+    sent = {}
+
+    def _fake_post(url, *, headers, timeout, stream, attempts, label, **req_kw):
+        sent.clear()
+        sent.update(req_kw)
+        raise RuntimeError("stop-before-response")   # 只看发出去什么，不解析响应
+
+    ac._post_with_retry = _fake_post
+    try:
+        for kwargs, check in (
+            ({"n": 1}, lambda f: f.get("n") == "1"),
+            ({"n": 0}, lambda f: "n" not in f),      # 0 = 不发送
+        ):
+            p = ac.build_params(model="gpt-image-2", prompt="x", size="1024x1024", **kwargs)
+            try:
+                ac.edit_images("https://gw.example.com/v1", "sk-test", p, [b"fake-png"],
+                               stream=True, partial_images=2)
+            except RuntimeError as e:
+                assert "stop-before-response" in str(e), e
+            form = sent.get("data") or {}
+            assert check(form), form
+            assert all(isinstance(v, str) for v in form.values()), form
+            assert form.get("stream") == "true"          # 不是 "True"
+            assert form.get("partial_images") == "2"
+            assert form.get("model") == "gpt-image-2"
+    finally:
+        ac._post_with_retry = orig_post
 
     # ── size_from_wh：0 -> auto，>0 -> 拼接（不再自行打印/校验）──
     assert ac.size_from_wh(0, 0) == "auto"

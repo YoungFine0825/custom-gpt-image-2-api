@@ -54,7 +54,7 @@ cd custom-gpt-image-2-api && pip install -r requirements.txt
 | 图片2~8 | — | 可选 | 追加参考图(共最多 8 张) |
 | 遮罩 mask | — | 可选 | `MASK` 输入;透明(选中)区域会被编辑 |
 | 输入保真度 input_fidelity | — | 可选 | `default`/`low`/`high`;参考图保真度。**仅编辑端点**,且 `gpt-image-2` 会忽略(恒为 high) |
-| 数量 n | ✅ | ✅ | 1~10,多张尺寸一致时合并为批次 |
+| 数量 n | ✅ | ✅ | 0~10,**默认 0 = 不发送该字段**(服务端定,通常 1,兼容性最好);填 2~10 一次多张,尺寸一致时合并为批次 |
 | 质量 quality | ✅ | ✅ | `default`/`auto`/`high`/`medium`/`low` |
 | 背景 background | ✅ | ✅ | `default`/`auto`/`transparent`/`opaque` |
 | 输出格式 output_format | ✅ | ✅ | `default`/`png`/`jpeg`/`webp` |
@@ -112,10 +112,13 @@ python test_api.py --base https://your-endpoint/v1 --key sk-你的key --model gp
 
 成功会把图存成 `test_output.png`。401 一般是 key 错误,400 多为模型名 / 参数不被服务端接受。
 
+报错怎么读:非 200 时插件会给出「状态码 + 从正文提炼的关键信息 + 诊断头(`cf-ray` 等) + 本次实际发送的字段 + 按状态码的下一步提示」,完整响应正文另打进 ComfyUI 控制台日志。详见 [`docs/usage-and-security.md` 第 9 节](docs/usage-and-security.md)。
+
 ## 安全说明(数据流向)
 
 - 请求只发往你在配置节点填写的 `base_url`;代码里没有任何预设域名、没有第三方图床、没有遥测 / 数据上报。
-- **密钥不再随工作流保存**(v3.4.0 修复):插件通过前端扩展把「密钥」widget 的持久化关闭,`api_key` **不会**写进导出的工作流 `.json`(也不进导出 PNG 内嵌的 workflow),分享工作流不会泄露密钥。同时密钥按 `base_url` 存进浏览器 localStorage,**本机重开工作流时自动回填、无需重填**。密钥仍会正常随请求发给后端执行。
+- **密钥不再随工作流保存**(v3.4.0 修复):插件通过前端扩展把「密钥」widget 的持久化关闭,`api_key` **不会**写进导出的工作流 `.json`(也不进导出 PNG 内嵌的 workflow),分享工作流不会泄露密钥。同时密钥存进浏览器 localStorage,**本机重开工作流时自动回填、无需重填**。密钥仍会正常随请求发给后端执行。
+- **多个配置节点各自独立**(v3.5.0 修复):此前本机密钥存档按 `base_url` 归档,是所有配置节点**共享的一格**——两个节点填同一个地址时后改的会覆盖先前的;**Clone / 复制粘贴节点后必然踩中**(副本继承同一地址,在副本上配好密钥、刷新后原节点的密钥反被换成副本的);且「先填密钥、后填地址」会导致密钥根本没落盘、重开即丢。现在**每个配置节点各有一格存档**(节点内持久 uuid 为键),写入只碰自己那格,互不干扰;Clone / 粘贴出的副本会自动分家(继承一份值的副本,但从此各写各的)。
 - 详见 [`docs/usage-and-security.md`](docs/usage-and-security.md)。
 
 ## 开发文档
