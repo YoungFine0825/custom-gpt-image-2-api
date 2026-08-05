@@ -52,7 +52,21 @@ def _common_optional():
         # 优先按服务端 Retry-After 等待，否则指数退避(封顶 60s)。
         "重试次数": ("INT", {"default": 2, "min": 0, "max": 5, "step": 1,
                           "tooltip": "遇到 429/5xx/超时/连接重置时的最大重试次数。"
-                                     "0=不重试。总请求次数 = 重试次数 + 1。"}),
+                                     "0=不重试。总请求次数 = 重试次数 + 1。"
+                                     "也用于「从网关图床下载成品图」那一步的重试。"
+                                     "上游高峰不稳时建议 3~5。"
+                                     "注意：4xx(参数错误/审核拦截)不会重试，重试也没用。"}),
+        # 返回格式 (response_format)：默认 default = 不发送，见 api_client 里的说明。
+        # 放在最后一个，是为了不打乱既有 widget 顺序（见 CLAUDE.md 不变量 4：
+        # ComfyUI 按位置还原 widgets_values，在中间插入会让旧工作流读到错位的值）。
+        "返回格式": (api_client.RESPONSE_FORMAT_OPTIONS, {
+            "default": "default",
+            "tooltip": "default=不发送该字段(官方接口必须用这个：官方 GPT-Image 恒返回 "
+                       "base64，发送此字段反而会 400)。\n"
+                       "b64_json=要求图片以内联 base64 返回：仅用于「只回图片 url 的"
+                       "兼容网关」——可绕开网关图床，解决『图已生成但下载失败(504)』"
+                       "以及 数量>1 时更容易失败的问题。\n"
+                       "url=要求返回链接(一般不需要)。"}),
     }
 
 
@@ -92,6 +106,7 @@ class GPTImageGenerate:
             output_format=kw.get("输出格式", "default"),
             output_compression=kw.get("压缩质量"),
             moderation=kw.get("审核级别", "default"),
+            response_format=kw.get("返回格式", "default"),
         )
         img = api_client.generate_images(
             base_url, api_key, params,
@@ -155,6 +170,7 @@ class GPTImageEdit:
             output_compression=kw.get("压缩质量"),
             moderation=kw.get("审核级别", "default"),
             input_fidelity=kw.get("输入保真度", "default"),
+            response_format=kw.get("返回格式", "default"),
         )
         img = api_client.edit_images(
             base_url, api_key, params, ref_pngs, mask_png,

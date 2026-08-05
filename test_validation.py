@@ -6,6 +6,13 @@
 全部通过打印 "ALL PASS"，任何断言失败会抛出。
 """
 
+import base64
+import http.client
+
+import requests
+import torch
+import urllib3.exceptions
+
 import api_client as ac
 
 
@@ -221,6 +228,122 @@ def main():
     assert ac.snap_dim(9999) == ac.GPT_IMAGE_2_MAX_EDGE  # hi 缺省=3840
     assert ac.snap_dim(1000, 8) == 1000                 # step=8：1000 已是 8 倍数
     assert ac.snap_dim(1000, 32, 16, 3840) == 992       # step=32：(1000+16)//32*32
+
+    # ── SSE 解析：按规范 + 官方事件枚举，不靠子串猜测 ──
+    class _FakeSSE:
+        """假响应：按 SSE 规范逐行喂，验证 _sse_events / _images_from_stream。"""
+        def __init__(self, text):
+            self._text = text
+            self.headers = {"Content-Type": "text/event-stream"}
+
+        def iter_lines(self, decode_unicode=True):
+            for line in self._text.split("\n"):
+                yield line
+
+    png_b64 = base64.b64encode(ac.tensor_to_png_bytes(torch.zeros(8, 8, 3))).decode()
+
+    # 1) 规范形状：event: 行 + data: 行
+    stream = ("event: image_edit.completed\n"
+              'data: {"type":"image_edit.completed","b64_json":"%s"}\n'
+              "\n" % png_b64)
+    out = ac._images_from_stream(_FakeSSE(stream))
+    assert len(out) == 1 and out[0].shape == (1, 8, 8, 3), [t.shape for t in out]
+
+    # 2) **data 跨多行**（规范允许：多个 data: 行按 \n 拼成一个事件的数据）。
+    #    旧实现逐行 json.loads，跨行事件会全部解析失败 -> 表现为「流里没拿到图片」，
+    #    白丢一张已计费的图。注意断行须落在 JSON **token 之间**（换行在那里是合法
+    #    空白）；断在字符串字面量中间本身就是非法 JSON，与解析器无关。
+    multi = ('data: {"type":"image_edit.completed",\n'
+             'data: "b64_json":\n'
+             'data: "%s"}\n'
+             "\n" % png_b64)
+    out = ac._images_from_stream(_FakeSSE(multi))
+    assert len(out) == 1 and out[0].shape == (1, 8, 8, 3), "跨行 data 必须拼接后解析"
+
+    # 3) 注释/心跳行(`: ping`)按规范忽略，不能当成事件或报错
+    with_ping = (": ping\n"
+                 "event: image_generation.completed\n"
+                 'data: {"type":"image_generation.completed","b64_json":"%s"}\n'
+                 "\n" % png_b64)
+    assert len(ac._images_from_stream(_FakeSSE(with_ping))) == 1
+
+    # 4) partial 只有预览、无 completed -> 必须报错，绝不能把糊预览当成品返回
+    only_partial = ('data: {"type":"image_edit.partial_image","b64_json":"%s",'
+                    '"partial_image_index":0}\n\n' % png_b64)
+    try:
+        ac._images_from_stream(_FakeSSE(only_partial))
+        raise AssertionError("只有 partial 时必须抛错")
+    except RuntimeError as e:
+        assert "没有收到成品图" in str(e), e
+
+    # 5) 流内错误事件（规范外，按**结构**判定：存在非空 error 对象）
+    err_stream = ('data: {"type":"error","error":{"message":"unsafe content",'
+                  '"code":"ERR-1"}}\n\n')
+    try:
+        ac._images_from_stream(_FakeSSE(err_stream))
+        raise AssertionError("流内错误必须抛出")
+    except RuntimeError as e:
+        assert "unsafe content" in str(e), e
+
+    # 6) 认定为错误却挖不出消息时，不能返回 ""（否则被当成「不是错误」而继续）
+    assert ac._stream_error_message({"type": "error"}) != ""
+    assert ac._stream_error_message({"error": {"weird": 1}}) != ""
+    # 7) 关键回归：正常事件即使名字里带 "error" 也**不能**误判为失败。
+    #    旧实现用 `"error" in etype` 子串匹配，会把已出的图谎报成失败。
+    assert ac._stream_error_message(
+        {"type": "image_edit.error_corrected", "b64_json": "x"}) == ""
+    assert ac._stream_error_message({"type": "image_edit.completed",
+                                     "b64_json": "x", "error": None}) == ""
+    assert ac._stream_error_message({"type": "image_edit.completed",
+                                     "b64_json": "x", "error": {}}) == ""
+    ok_stream = ('data: {"type":"image_edit.error_corrected","b64_json":"%s"}\n\n'
+                 % png_b64)
+    assert len(ac._images_from_stream(_FakeSSE(ok_stream))) == 1, "带 error 字样的正常事件被误杀"
+
+    # ── 400 的提示要按「原因」分流，不能一律叫用户去核对参数 ──
+    # 审核拦截同样是 400，但与参数无关；早先固定回「参数被上游拒绝」，属误导。
+    mod_hint = ac._status_hint(400, "The generated images appear to be unsafe. "
+                                    "Try modifying the prompts or the seeds.")
+    assert "内容审核" in mod_hint, mod_hint
+    assert "别去核对参数" in mod_hint, mod_hint       # 明确否掉「查参数」这条错误指引
+    assert "计费" in mod_hint, mod_hint               # 产物被拦截≠没生成，须提示核对用量
+    param_hint = ac._status_hint(400, "invalid value for 'n'")
+    assert "参数被上游拒绝" in param_hint, param_hint
+    assert "内容审核" not in param_hint, param_hint
+    # 网关解析上游响应失败(500 bad_response_body) 与本次参数无关，单独分流。
+    body_hint = ac._status_hint(500, "invalid character 'e' looking for beginning of value")
+    assert "解析上游响应失败" in body_hint, body_hint
+    assert "重试即可" in ac._status_hint(500, "internal error")
+
+    # ── 网络层异常：判定必须靠异常类型/异常链(isinstance)，不靠 str 关键字 ──
+    # 构造与实测一致的两层链：requests.ProxyError <- MaxRetryError <- RemoteDisconnected
+    inner = http.client.RemoteDisconnected("Remote end closed connection without response")
+    u3_proxy = urllib3.exceptions.ProxyError("Unable to connect to proxy", inner)
+    u3_proxy.__cause__ = inner
+    max_retry = urllib3.exceptions.MaxRetryError(None, "/v1/images/edits", reason=u3_proxy)
+    proxy_exc = requests.exceptions.ProxyError(max_retry)
+    assert ac._chain_has(proxy_exc, http.client.RemoteDisconnected), "异常链遍历失效"
+    msg = ac._transport_error_message("edits", proxy_exc, "https://x.example/v1")
+    assert "与本节点的「重试次数」无关" in msg, msg       # 纠正 Max retries 误读
+    assert "已送达上游" in msg and "计费" in msg, msg     # 纠正「连不上代理」误读
+    assert "内层原因链" in msg and "RemoteDisconnected" in msg, msg
+    # 不含断连内层的纯代理错误，不得谎称「已送达上游」
+    assert "已送达上游" not in ac._transport_error_message(
+        "edits", requests.exceptions.ProxyError("Unable to connect to proxy"))
+    # 子类顺序：ConnectTimeout/SSLError 都是 ConnectionError 子类，不能落到笼统分支
+    assert "连接超时" in ac._transport_error_message(
+        "edits", requests.exceptions.ConnectTimeout("timed out"))
+    assert "读取超时" in ac._transport_error_message(
+        "edits", requests.exceptions.ReadTimeout("timed out"))
+    assert "TLS 握手失败" in ac._transport_error_message(
+        "edits", requests.exceptions.SSLError("wrong version number"))
+
+    # ── 「返回格式」必须真的进请求（曾经 widget 声明了却没接线，选了等于没选）──
+    p = ac.build_params("gpt-image-2", "x", response_format="b64_json")
+    assert p.get("response_format") == "b64_json", p
+    assert "response_format" not in ac.build_params("gpt-image-2", "x")          # default 不发送
+    assert "response_format" not in ac.build_params("gpt-image-2", "x",
+                                                   response_format="default")
 
     print("ALL PASS")
 

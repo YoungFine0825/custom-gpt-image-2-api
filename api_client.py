@@ -24,8 +24,10 @@ data[].url (DALL-E 风格) 读取；流式结果从 *.completed 事件的 b64_js
 """
 
 import base64
+import http.client
 import io
 import json
+import os
 import re
 import socket
 import threading
@@ -34,6 +36,7 @@ import time
 import numpy as np
 import requests
 import torch
+import urllib3.exceptions
 from PIL import Image
 from urllib3.connection import HTTPConnection
 
@@ -44,6 +47,16 @@ OUTPUT_FORMAT_OPTIONS = ["default", "png", "jpeg", "webp"]
 MODERATION_OPTIONS = ["default", "auto", "low"]
 # 输入保真度 (input_fidelity)：仅 /images/edits 有意义；default = 不发送。
 INPUT_FIDELITY_OPTIONS = ["default", "low", "high"]
+# 返回格式 (response_format)：**默认必须是 default(不发送)**。
+# 官方 GPT-Image 系列**不支持**该字段——文档明确「This parameter isn't supported for
+# the GPT image models, which always return base64-encoded images.」，且实测在
+# /images/edits 上发它会 400，报错还误指向 `model`（"Value must be 'dall-e-2'"），
+# 极难排查。所以绝不能默认发送。
+# 但不少兼容网关**不返回内联 base64、而是把成品图放自家图床再回 url**，那个图床在
+# 高峰期常抖(504)，导致「图生成好了却下载失败」。对这类网关，显式发
+# response_format=b64_json 可让图片内联返回、完全绕开图床(实测有效)。
+# 故设计成手动开关：默认 default 保证对官方与严格网关安全，需要时再开。
+RESPONSE_FORMAT_OPTIONS = ["default", "b64_json", "url"]
 
 # 连接建立超时(秒)；读取超时由调用方按生图时长传入(可能很久)。
 CONNECT_TIMEOUT = 15
@@ -392,13 +405,25 @@ def _validate(params):
         print("[GPT-Image] %s 忽略 input_fidelity（该模型输入始终高保真）。" % model)
         params.pop("input_fidelity", None)
 
+    # 4) response_format：官方 GPT-Image 系列不支持该字段（文档明确「always return
+    #    base64-encoded images」），实测在官方 /images/edits 上发它会 400、且报错误
+    #    指向 `model`（"Value must be 'dall-e-2'"），极难排查。
+    #    但**这里只警告、不丢弃**：模型名不足以判断对端是官方还是兼容网关——实测有
+    #    网关自报 model=gpt-image-2 却返回 url(官方从不返回 url)、并正常接受
+    #    response_format。对这类网关，显式发 b64_json 正是绕开不稳图床的唯一手段。
+    #    该字段默认是 default(不发送)，出现在这里说明用户主动选了，遵从用户判断。
+    if params.get("response_format") and strict:
+        print("[GPT-Image] 注意：%s 按官方文档**不支持** response_format（官方恒返回 "
+              "base64，发送可能回 400 且报错误指向 model）。仅当你的网关只回 url、"
+              "需要强制内联 base64 时才保留此项；连官方接口请设回 default。" % model)
+
     return params
 
 
 def build_params(model, prompt, size="auto", n=1, quality="default",
                  background="default", output_format="default",
                  output_compression=None, moderation="default",
-                 input_fidelity="default"):
+                 input_fidelity="default", response_format="default"):
     """构造两个端点共用的参数字典。枚举取 "default" 时不发送该字段。
 
     n（数量）沿用同一套「不发送」约定：n <= 0 或无法解析成整数时**不发送 n**，
@@ -431,6 +456,7 @@ def build_params(model, prompt, size="auto", n=1, quality="default",
         ("output_format", output_format),
         ("moderation", moderation),
         ("input_fidelity", input_fidelity),
+        ("response_format", response_format),
     ):
         v = _clean(val)
         if v and v != "default":
@@ -445,7 +471,46 @@ def build_params(model, prompt, size="auto", n=1, quality="default",
     return _validate(params)
 
 
-def _images_from_response(resp_json, timeout):
+def _download_image(url, timeout, attempts, index=0, total=1):
+    """下载一张结果图，对瞬时错误重试。返回图片字节。
+
+    为什么必须重试(而不是像早先那样一次失败就整体报错)：很多兼容网关不返回内联
+    base64，而是把成品图先放自家图床再回 url。**这一步与生图是两套服务**——图床在
+    高峰期抖动(504/连接重置)非常常见，实测同一个 url 首次 504、1.5s 后重试即 200。
+    而此时图已经生成、已经计费，若不重试就整批丢弃，等于白花钱。`数量(n)>1` 时更
+    致命：每多一张就多一次抖动机会，任一张失败会连带丢掉其余已下载成功的图。
+    """
+    last = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            r = _session().get(url, timeout=(CONNECT_TIMEOUT, timeout))
+        except requests.RequestException as e:
+            last = "%s: %s" % (e.__class__.__name__, e)
+        else:
+            if r.status_code == 200:
+                return r.content
+            last = "HTTP %s" % r.status_code
+            # 非瞬时错误(如 403/404 签名过期)重试无意义，直接失败。
+            if r.status_code not in RETRYABLE_STATUS:
+                attempt = attempts
+            r.close()
+        if attempt >= attempts:
+            break
+        wait = min(MAX_BACKOFF, _backoff_seconds(attempt))
+        print("[GPT-Image] 第 %d/%d 张结果图下载失败(%s)，%.1fs 后重试。"
+              % (index + 1, total, last, wait))
+        time.sleep(wait)
+        _check_interrupt()
+    raise RuntimeError(
+        "[GPT-Image] 下载第 %d/%d 张结果图失败(已试 %d 次): %s\n"
+        "  说明: 图片已由上游生成(可能已计费)，失败发生在**从网关图床取图**这一步，"
+        "与提示词/参数无关。\n"
+        "  提示: 这类抖动多为图床临时故障——可加大「重试次数」；若网关支持，"
+        "把「返回格式」设为 b64_json 让图片内联返回，即可完全绕开图床。\n"
+        "  url=%s" % (index + 1, total, max(1, int(attempts)), last, url))
+
+
+def _images_from_response(resp_json, timeout, attempts=1):
     """OpenAI ImagesResponse -> list of ComfyUI IMAGE tensors [1,H,W,3]。
 
     优先读内联的 base64 (b64_json，GPT image 模型默认返回)；否则回退到 url
@@ -454,73 +519,188 @@ def _images_from_response(resp_json, timeout):
     data = (resp_json or {}).get("data") or []
     if not data:
         # 200 但没有图：可能是网关把错误塞进了 200 响应，故沿用同一套提炼逻辑。
+        # 实测确有网关在限流时回 200 + 错误正文而非 429，故不能只看状态码。
         detail = _dig_error_message(resp_json) or _collapse(str(resp_json))[:MAX_ERROR_BODY]
         raise RuntimeError("[GPT-Image] 响应里没有图片数据 (data 为空): %s" % detail)
     tensors = []
-    for item in data:
+    for i, item in enumerate(data):
         b64 = item.get("b64_json")
         if b64:
             tensors.append(bytes_to_tensor(base64.b64decode(b64)))
             continue
         url = item.get("url")
         if url:
-            try:
-                r = _session().get(url, timeout=(CONNECT_TIMEOUT, timeout))
-            except requests.RequestException as e:
-                raise RuntimeError("[GPT-Image] 下载结果图片失败: %s" % e)
-            if r.status_code != 200:
-                raise RuntimeError("[GPT-Image] 下载结果图片失败 (%s)" % r.status_code)
-            tensors.append(bytes_to_tensor(r.content))
+            tensors.append(bytes_to_tensor(
+                _download_image(url, timeout, attempts, index=i, total=len(data))))
             continue
         raise RuntimeError("[GPT-Image] 结果项既无 b64_json 也无 url: %s" % str(item)[:300])
     return tensors
 
 
+# ── SSE 事件类型 (documented event enum) ────────────────────────────────────
+# 官方只定义了这 4 个 type 值，**没有**定义任何错误事件：
+#   https://developers.openai.com/api/reference/resources/images/generation-streaming-events
+#   https://developers.openai.com/api/reference/resources/images/edit-streaming-events/
+# 故解析策略分两层，优先级明确：
+#   1) 规范内事件 -> 对这个闭集**精确匹配**（不做子串猜测）。
+#   2) 流内错误   -> 规范外的网关扩展。既然无规范可依，就用**结构**判定
+#      (存在非空 error 对象)，而不是在 type 里找 "error" 这类关键字。
+PARTIAL_EVENTS = frozenset(("image_generation.partial_image", "image_edit.partial_image"))
+COMPLETED_EVENTS = frozenset(("image_generation.completed", "image_edit.completed"))
+# 规范外但实测存在的错误事件名（各网关自造）。仅作为**精确**匹配集，不做子串匹配。
+ERROR_EVENTS = frozenset(("error", "image_generation.failed", "image_edit.failed",
+                          "response.failed", "failed"))
+
+
+def _sse_events(resp):
+    """按 SSE 规范 (W3C/WHATWG server-sent events) 解析事件流。
+
+    此前的实现只扫 `data:` 行、且把每行当成一个完整事件，这偏离规范两处：
+      - 规范允许**同一事件的 data 跨多行**，须按出现顺序用 "\\n" 拼接，
+        遇空行(dispatch)才算一个事件结束。图片 base64 很长，一旦上游分多行发，
+        逐行 json.loads 会全部解析失败 -> 表现为「流里没拿到图片」。
+      - 事件**名**规范上在 `event:` 字段里；本 API 的事件名同时也放在 JSON 的
+        `type` 字段。故这里两个都取，以 `event:` 为先、`type` 兜底。
+    以 `:` 开头的行是注释/心跳(如 `: ping`)，按规范忽略——它正是保活用的。
+
+    yield (event_name, data_str)；不解析 JSON，交给调用方。
+    """
+    event_name = ""
+    data_lines = []
+    for raw in resp.iter_lines(decode_unicode=True):
+        _check_interrupt()   # 流式迭代间隙检查中断，比单次阻塞更及时
+        if raw is None:
+            continue
+        line = raw.rstrip("\r")
+        if line == "":                       # 空行 = dispatch 事件
+            if data_lines:
+                yield event_name, "\n".join(data_lines)
+            event_name = ""
+            data_lines = []
+            continue
+        if line.startswith(":"):             # 注释/心跳，规范要求忽略
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):            # 规范：冒号后**单个**前导空格要去掉
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+        # id / retry 字段本 API 用不到，按规范忽略即可
+    if data_lines:                           # 流尾没有空行时也要 dispatch
+        yield event_name, "\n".join(data_lines)
+
+
+def _stream_error_message(obj):
+    """从 SSE 事件里识别「流内错误事件」，返回可读消息；不是错误事件则返回 ""。
+
+    官方规范**没有**定义错误事件（只有 partial_image / completed），但实测上游确会
+    在 HTTP 200 之后于流内推 `{"type":"error","error":{...}}`（审核拒绝、上游崩溃）。
+    早先的解析器「没有 b64_json 就 continue」会把它整个吞掉，最终只报一句「没拿到
+    图片」，真正的原因(如违规拦截)完全看不到。
+
+    既然无规范可依，判定就以**结构**为准、而非关键字：
+      1) 存在非空 `error` 对象/字符串 -> 是错误事件（最可靠，与事件名无关）；
+      2) 或 type 精确命中 ERROR_EVENTS（各网关自造的错误事件名）。
+    刻意**不再**用 `"error" in type` 这类子串匹配：那会把未来任何名字里带 error 的
+    正常事件误判成失败，把「已出图」谎报成「失败」。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    has_err_obj = (isinstance(err, dict) and bool(err)) or \
+                  (isinstance(err, str) and bool(err.strip()))
+    etype = str(obj.get("type", "") or "")
+    if not has_err_obj and etype not in ERROR_EVENTS:
+        return ""
+    msg = _dig_error_message(obj)
+    if msg:
+        extra = [str(obj[k]) for k in ("code", "param") if obj.get(k)]
+        return msg + ("  [%s]" % ", ".join(extra) if extra else "")
+    # 认定为错误却挖不出消息时，绝不能返回 "" —— 那会让调用方以为「不是错误」而继续，
+    # 最终把真正的失败原因丢掉。原样回传截断后的事件内容。
+    return _collapse(str(obj))[:MAX_ERROR_BODY] or "(错误事件，但无可读消息)"
+
+
 def _images_from_stream(resp):
     """解析 SSE 流：累积 partial 预览，返回最终 completed 的图 [1,H,W,3]。
 
-    事件形如 (data: 后是 JSON，带 type 字段)：
-      image_generation.partial_image / image_edit.partial_image  -> 进度预览
-      image_generation.completed     / image_edit.completed      -> 最终图
+    事件类型按官方枚举**精确**匹配（见 PARTIAL_EVENTS / COMPLETED_EVENTS）；
+    对未知事件名(兼容网关自造)保留「有 b64_json 就当成品」的兜底，否则整条流白丢。
+    n>1 时按 completed 事件出现顺序收集**多张**成品图：规范未定义多图流式语义
+    (completed 事件上没有图序号字段，只有 partial 事件有 partial_image_index)，
+    故不依赖任何索引字段，只按到达顺序追加，天然兼容「一图一 completed」。
     """
-    final_b64 = None
+    finals = []
     last_partial = None
-    for raw in resp.iter_lines(decode_unicode=True):
-        _check_interrupt()   # SSE 流式迭代间隙检查中断，比单次阻塞更及时
-        if not raw:
-            continue
-        line = raw.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
+    partial_count = 0
+    unknown_types = []
+    for event_name, payload in _sse_events(resp):
         if not payload or payload == "[DONE]":
             continue
         try:
             obj = json.loads(payload)
         except ValueError:
             continue
-        b64 = obj.get("b64_json")
-        if not b64:
+        if not isinstance(obj, dict):
             continue
-        etype = str(obj.get("type", ""))
-        if etype.endswith("completed"):
-            final_b64 = b64
-        elif etype.endswith("partial_image"):
-            last_partial = b64
-            print("[GPT-Image] 流式预览 #%s 已接收（保活中）" % obj.get("partial_image_index"))
-        else:
-            final_b64 = final_b64 or b64
-    b64 = final_b64 or last_partial
-    if not b64:
-        raise RuntimeError("[GPT-Image] 流式响应里没有拿到图片（无 completed/partial 事件）。")
-    return [bytes_to_tensor(base64.b64decode(b64))]
+        # 错误事件优先：HTTP 已经 200，真正的失败原因只在流里，必须抛出而非吞掉。
+        err = _stream_error_message(obj)
+        if err:
+            raise RuntimeError(
+                "[GPT-Image] 流式响应中上游报错: %s\n"
+                "  说明: HTTP 状态码是 200，错误在 SSE 流内推送，与网络无关，"
+                "重试通常无用。" % err)
+        # 事件名：规范在 `event:` 字段，本 API 同时放在 JSON 的 type，两者都认。
+        etype = event_name or str(obj.get("type", "") or "")
+        b64 = obj.get("b64_json")
+        if etype in COMPLETED_EVENTS:
+            if b64:
+                finals.append(b64)
+            continue
+        if etype in PARTIAL_EVENTS:
+            if b64:
+                partial_count += 1
+                last_partial = b64
+                print("[GPT-Image] 流式预览 #%s 已接收（保活中）"
+                      % obj.get("partial_image_index", partial_count - 1))
+            continue
+        # 规范外事件名：只要带成品图就收下（兼容自造事件名的网关），否则记下备诊断。
+        if b64:
+            finals.append(b64)
+        elif etype:
+            unknown_types.append(etype)
+    if finals:
+        return [bytes_to_tensor(base64.b64decode(b)) for b in finals]
+    # 只有 partial、没有 completed：流被中途掐断(代理超时/上游崩溃)。绝不能把
+    # 低清预览图当成品静默返回——那会让「生成失败」伪装成「生成了一张糊图」。
+    if last_partial is not None:
+        raise RuntimeError(
+            "[GPT-Image] 流式响应只收到预览图(partial_image)、没有收到成品图"
+            "(completed)：流在完成前被中断（常见于中间代理空闲超时或上游崩溃）。\n"
+            "  说明: 已收到 %d 个预览事件，故请求确实到达并开始生成；缺的是最后一步。"
+            "上游可能已计费。\n"
+            "  提示: 可加大「超时秒数」；若反复如此，关掉「流式」改用非流式，"
+            "或联系网关方。" % partial_count)
+    raise RuntimeError(
+        "[GPT-Image] 流式响应里没有拿到图片（无 completed/partial 事件）。%s\n"
+        "  提示: 该网关可能并未真正实现 SSE 流式(有的网关会忽略 stream 参数)，"
+        "可关掉「流式」重试。"
+        % ("收到的未知事件类型: %s。" % ", ".join(sorted(set(unknown_types))[:8])
+           if unknown_types else ""))
 
 
-def _result_tensors(resp, timeout, stream):
-    """按响应类型解析：SSE 走流式解析；否则(含网关未按 SSE 返回)走普通 JSON。"""
+def _result_tensors(resp, timeout, stream, attempts=1):
+    """按响应类型解析：SSE 走流式解析；否则(含网关未按 SSE 返回)走普通 JSON。
+
+    注意「请求了 stream 但响应不是 event-stream」是常见情况(不少兼容网关直接忽略
+    stream 参数，实测本仓库测过的网关即如此)，此时按普通 JSON 解析、并把下载重试
+    次数一并传下去。
+    """
     if stream and "text/event-stream" in resp.headers.get("Content-Type", ""):
         return _images_from_stream(resp)
-    return _images_from_response(resp.json(), timeout)
+    return _images_from_response(resp.json(), timeout, attempts)
 
 
 def _retry_after_seconds(resp):
@@ -668,14 +848,25 @@ def _request_summary(req_kw):
     return ", ".join(parts)
 
 
-def _status_hint(code):
-    """按状态码给一句「下一步查哪里」的提示。"""
+def _status_hint(code, message=""):
+    """按状态码给一句「下一步查哪里」的提示；message 用于区分同码不同因。"""
+    low = (message or "").lower()
     if code in (401, 403):
         return "鉴权失败：检查「密钥」是否正确/已过期，以及该密钥在此网关是否有图像权限。"
     if code == 404:
         return ("端点不存在：检查「接口地址」是否漏了/多了 `/v1`（本插件会自行拼接 "
                 "`/images/generations` 与 `/images/edits`），以及该网关是否真的支持该端点。")
     if code == 400:
+        # 审核拦截同样走 400，但与参数无关——若还让用户去核对参数，纯属误导。
+        # 注意「generated images ... unsafe」指**产物**被判定违规(生成已发生)，
+        # 与「输入图/提示词被拒」不同，重试或改参数都无用，只能改提示词/换图。
+        if ("unsafe" in low or "safety" in low or "moderation" in low
+                or "content_policy" in low or "content policy" in low):
+            return ("这是**内容审核拦截**，不是参数问题——别去核对参数。"
+                    "若报的是「generated images appear to be unsafe」，说明图已经生成、"
+                    "但成品被判定违规而不返回（可能已计费）。重试通常无效："
+                    "请改提示词、或更换/裁剪参考图中的敏感部分；"
+                    "「审核级别」设为 low 也许可放宽（需网关支持）。")
         return ("参数被上游拒绝：对照上面「本次发送」逐项核对。注意 edits 走 "
                 "multipart，协议上所有值都是字符串（如 n='1'）；若网关对某字段"
                 "强校验类型，可把对应参数设为 default/0 使其整字段不发送。")
@@ -688,8 +879,158 @@ def _status_hint(code):
                 "（源站超时/崩溃/握手失败），不是本插件的参数问题。生图耗时长时尤其"
                 "常见：可开「流式」保活、加大「重试次数」，或联系网关方。")
     if code in (500, 502, 503, 504):
+        # 网关把上游响应解析失败也报 500，这类与本次参数无关，说清楚免得白折腾。
+        if "looking for beginning of value" in low or "bad_response_body" in low:
+            return ("网关**解析上游响应失败**（它期待 JSON 却收到别的内容，常见于上游返回"
+                    "了 HTML 错误页或空响应）。属网关/上游侧故障，与本次参数无关，"
+                    "重试或稍后再试；持续出现请联系网关方。")
         return "网关/上游暂时不可用：通常重试即可；持续出现请联系网关方。"
     return ""
+
+
+def _exc_chain(exc, limit=12):
+    """迭代异常链上的每一环，用于**结构化**判定内层原因（取代字符串匹配）。
+
+    requests 把底层异常包了三层，且各层挂载位置不同（实测 requests 2.32 /
+    urllib3 2.x，见下），只看 __cause__ 会漏：
+
+      场景「隧道未建成」: requests.ConnectionError
+                          -> args[0] = urllib3.ProtocolError
+                          -> __context__ = http.client.RemoteDisconnected
+      场景「隧道已建成」: requests.ProxyError
+                          -> args[0] = urllib3.MaxRetryError
+                          -> .reason  = urllib3.ProxyError
+                          -> __cause__= http.client.RemoteDisconnected
+
+    故依次尝试 __cause__ / __context__ / args[0] / MaxRetryError.reason。
+    这样判定内层原因就能用 isinstance，而不是在 str(exc) 里找关键字——后者会随
+    上游库措辞改动而静默失效。
+    """
+    seen = set()
+    cur = exc
+    depth = 0
+    while cur is not None and id(cur) not in seen and depth < limit:
+        seen.add(id(cur))
+        depth += 1
+        yield cur
+        nxt = cur.__cause__ or cur.__context__
+        if nxt is None and getattr(cur, "args", None):
+            first = cur.args[0]
+            if isinstance(first, BaseException):
+                nxt = first
+        if nxt is None:
+            nxt = getattr(cur, "reason", None)
+            if not isinstance(nxt, BaseException):
+                nxt = None
+        cur = nxt
+
+
+def _chain_has(exc, *types):
+    """异常链上是否出现过指定类型（结构化判定）。"""
+    return any(isinstance(e, types) for e in _exc_chain(exc))
+
+
+def _proxy_env_summary():
+    """本进程实际生效的代理环境变量摘要；没有则返回 ""。
+
+    requests 默认 trust_env=True，会自动读这些变量——ComfyUI 从 shell 继承到的
+    代理会**静默**接管所有出网请求。排查连接类报错时这是首要嫌疑，必须显式报出来。
+    """
+    bits = []
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(name)
+        if val:
+            bits.append("%s=%s" % (name, val))
+            break
+    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+    if bits and no_proxy:
+        bits.append("NO_PROXY=%s" % no_proxy)
+    return "; ".join(bits)
+
+
+def _transport_hint(exc, host=""):
+    """网络层异常 -> 「这句报错到底什么意思、下一步查哪里」。
+
+    判定**全部基于异常类型与异常链**（isinstance），不靠 str(exc) 里的关键字。
+
+    纠正两处极易误读的措辞（均由对照实验判定，非推测）：
+
+    1. **「Max retries exceeded」与本节点的「重试次数」无关**。那是 urllib3 自己的
+       连接级重试计数（requests 默认 0 次），措辞固定。把「重试次数」设成 0 也照样
+       出现这句，别据此以为插件在偷偷重试。判据：链上有 urllib3 MaxRetryError。
+
+    2. **ProxyError("Unable to connect to proxy") 的字面意思是错的**。它读起来像
+       「连不上代理、请求根本没发出去」，实际往往相反：CONNECT 隧道**早已建成、
+       请求已完整送达上游**，是代理在**等上游响应时**把隧道掐断了。根因是 urllib3
+       仅在 has_connected_to_proxy 为假时才套这层 ProxyError，而该标志在复用连接
+       等路径上并不可靠，于是响应阶段的断连被贴上了连接阶段的标签。
+       假代理对照实验（两种场景的**结构**可区分，故无需字符串匹配）：
+         - 收到 CONNECT 即关闭(隧道未建成) -> requests.ConnectionError + ProtocolError
+         - 回 200 建隧道、之后不回响应     -> requests.ProxyError + MaxRetryError
+       这个区别很要紧：请求既已送达，上游就**可能已经生成、已经计费**，
+       不能当成「没发出去的空跑」。
+    """
+    hints = []
+    dropped = _chain_has(exc, http.client.RemoteDisconnected, ConnectionResetError)
+
+    if _chain_has(exc, urllib3.exceptions.MaxRetryError):
+        hints.append("「Max retries exceeded」是 urllib3 的固定措辞，指它自己的连接级"
+                     "重试(默认 0 次)，**与本节点的「重试次数」无关**，设成 0 也会出现。")
+
+    # 顺序要紧：ProxyError/SSLError/ConnectTimeout 都是 requests.ConnectionError 的
+    # 子类，必须先判具体类型，最后才落到笼统的 ConnectionError。
+    if isinstance(exc, requests.exceptions.ProxyError):
+        if dropped:
+            hints.append("尽管写着「Unable to connect to proxy」，这**不是连不上代理**："
+                         "隧道已建成、请求已送达上游，是代理在等响应时掐断了连接。"
+                         "因此**上游可能已经生成并计费**，请去网关后台核对用量，"
+                         "不要当成空跑。")
+        else:
+            hints.append("代理层报错：先确认本机代理进程(Clash/V2Ray/公司代理等)正常工作。")
+    elif isinstance(exc, requests.exceptions.SSLError):
+        hints.append("TLS 握手失败：常见于代理做了中间人解密，或「接口地址」把 https "
+                     "写成了 http(反之亦然)。")
+    elif isinstance(exc, requests.exceptions.ConnectTimeout):
+        hints.append("连接超时(%ds 内没连上)：多为网络/代理不通，与参数无关，"
+                     "请求**未送达**。" % CONNECT_TIMEOUT)
+    elif isinstance(exc, requests.exceptions.ReadTimeout):
+        hints.append("读取超时：请求**已发出**、上游迟迟没回完。生图慢属正常，"
+                     "可调大「超时秒数」。")
+    elif isinstance(exc, requests.exceptions.ChunkedEncodingError):
+        hints.append("响应传输中断(分块编码未收完)：请求已送达、上游回传中途断开，"
+                     "**可能已计费**。")
+    elif isinstance(exc, requests.exceptions.ConnectionError) and dropped:
+        hints.append("连接被对端关闭：可能是代理/网关空闲超时或上游崩溃。")
+
+    env = _proxy_env_summary()
+    if env:
+        hints.append("本进程走的是代理: %s。生图要几十秒到十几分钟，而多数代理的"
+                     "空闲/单连接时限远小于此，容易中途掐断。可把网关域名%s加进 "
+                     "NO_PROXY 直连，或调大代理自身的 timeout。"
+                     % (env, ("(%s)" % host) if host else ""))
+    elif isinstance(exc, requests.exceptions.ProxyError):
+        hints.append("注意：报错来自代理层，但本进程环境变量里没看到代理设置——"
+                     "可能是系统级代理或代理自动配置(PAC)在生效。")
+
+    return hints
+
+
+def _transport_error_message(label, exc, url=""):
+    """网络层异常 -> 多行可排查消息（与 _http_error_message 同风格）。"""
+    host = ""
+    if url:
+        m = re.match(r"https?://([^/:]+)", url)
+        if m:
+            host = m.group(1)
+    lines = ["[GPT-Image] %s 请求失败: %s" % (label, exc),
+             "  异常类型: %s" % exc.__class__.__name__]
+    # 内层原因用类型名列出，比在长串消息里找关键字直观，也便于报障时贴给网关方。
+    chain = [type(e).__name__ for e in _exc_chain(exc)][1:]
+    if chain:
+        lines.append("  内层原因链: " + " <- ".join(chain))
+    for hint in _transport_hint(exc, host):
+        lines.append("  提示: " + hint)
+    return "\n".join(lines)
 
 
 def _safe_body(resp):
@@ -708,7 +1049,7 @@ def _http_error_message(label, resp, req_kw=None):
              % (label, resp.status_code, " " + reason if reason else "", short)]
     for tag, text in (("诊断", _response_diag(resp)),
                       ("本次发送", _request_summary(req_kw or {})),
-                      ("提示", _status_hint(resp.status_code))):
+                      ("提示", _status_hint(resp.status_code, short))):
         if text:
             lines.append("  %s: %s" % (tag, text))
     # 摘要之外的内容不丢：完整正文进日志，异常框只留提炼后的摘要。
@@ -724,17 +1065,35 @@ def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw
     只覆盖「请求建立 + 首个状态码」阶段；流式响应一旦在调用方开始迭代就不再重试，
     避免半消费的流被重放。参考图以 bytes 传入(非文件句柄)，可安全跨重试重发。
     返回 status==200 的 response，否则 raise RuntimeError。
+
+    抛出的消息里**必须带上每次尝试的历史**：只报最后一次的话，会出现「控制台看到
+    的原因」与「节点弹窗里的原因」对不上——比如第 1 次 502、第 2 次才是真正的 400
+    参数错误，或反过来第 1 次就是 400、后面被网关掩成 502。历史行让两者一致可核对。
     """
     attempts = max(1, int(attempts))
     last_err = None
+    history = []            # [(第几次, 状态码或异常名, 提炼后的原因)]
+
+    def _with_history(msg):
+        if len(history) <= 1:
+            return msg
+        lines = [msg, "  尝试历史(共 %d 次，最后一次即上面的报错):" % len(history)]
+        for i, what, why in history:
+            lines.append("    第 %d 次: %s — %s" % (i, what, why[:160]))
+        lines.append("  说明: 「重试次数」只对 429/5xx/超时/连接重置这类瞬时错误生效；"
+                     "若历史里出现过 4xx(参数/审核问题)，那次才是根因，重试无用。")
+        return "\n".join(lines)
+
     for attempt in range(1, attempts + 1):
         try:
             r = _interruptible_post(url, headers=headers,
                                     timeout=timeout, stream=stream, **req_kw)
         except requests.RequestException as e:
             last_err = e
+            history.append((attempt, e.__class__.__name__, str(e)))
             if attempt >= attempts:
-                raise RuntimeError("[GPT-Image] %s 请求失败: %s" % (label, e))
+                raise RuntimeError(_with_history(
+                    _transport_error_message(label, e, url)))
             wait = _backoff_seconds(attempt)
             print("[GPT-Image] %s 第 %d/%d 次请求异常(%s)，%.1fs 后重试。"
                   % (label, attempt, attempts, e.__class__.__name__, wait))
@@ -744,6 +1103,9 @@ def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw
         if r.status_code == 200:
             return r
 
+        why = _extract_error_message(_safe_body(r), r.headers.get("Content-Type", ""))
+        history.append((attempt, "HTTP %s" % r.status_code, why))
+
         # 非 200：可重试状态码且还有次数 -> 退避重试(优先用服务端的 Retry-After)。
         if attempt < attempts and r.status_code in RETRYABLE_STATUS:
             wait = _retry_after_seconds(r)
@@ -751,7 +1113,6 @@ def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw
                 wait = _backoff_seconds(attempt)
             wait = min(MAX_BACKOFF, wait)
             # 日志里带上提炼后的原因，避免「重试了但不知道在重试什么」。
-            why = _extract_error_message(_safe_body(r), r.headers.get("Content-Type", ""))
             print("[GPT-Image] %s 第 %d/%d 次返回 %s，%.1fs 后重试。原因: %s"
                   % (label, attempt, attempts, r.status_code, wait, why[:200]))
             r.close()
@@ -760,9 +1121,10 @@ def _post_with_retry(url, *, headers, timeout, stream, attempts, label, **req_kw
 
         msg = _http_error_message(label, r, req_kw)
         r.close()
-        raise RuntimeError(msg)
+        raise RuntimeError(_with_history(msg))
 
-    raise RuntimeError("[GPT-Image] %s 请求失败: %s" % (label, last_err))
+    raise RuntimeError(_with_history(
+        _transport_error_message(label, last_err, url)))
 
 
 def generate_images(base_url, api_key, params, timeout=900, stream=False,
@@ -777,7 +1139,7 @@ def generate_images(base_url, api_key, params, timeout=900, stream=False,
         payload["partial_images"] = _coerce_int(partial_images) or 0
     r = _post_with_retry(base + "/images/generations", headers=headers, timeout=timeout,
                          stream=stream, attempts=attempts, label="generations", json=payload)
-    return _stack(_result_tensors(r, timeout, stream))
+    return _stack(_result_tensors(r, timeout, stream, attempts))
 
 
 def edit_images(base_url, api_key, params, ref_pngs, mask_png=None,
@@ -800,16 +1162,25 @@ def edit_images(base_url, api_key, params, ref_pngs, mask_png=None,
         files.append(("mask", ("mask.png", mask_png, "image/png")))
     r = _post_with_retry(base + "/images/edits", headers=headers, timeout=timeout,
                          stream=stream, attempts=attempts, label="edits", data=form, files=files)
-    return _stack(_result_tensors(r, timeout, stream))
+    return _stack(_result_tensors(r, timeout, stream, attempts))
 
 
 def _stack(tensors):
-    """把多张 [1,H,W,3] 合并成一个 [N,H,W,3] 批次；尺寸不一致则只返回第一张。"""
+    """把多张 [1,H,W,3] 合并成一个 [N,H,W,3] 批次；尺寸不一致则只返回第一张。
+
+    ComfyUI 的 IMAGE 批次要求同尺寸，故尺寸不一致时无法合并。这里把「丢了几张」
+    说清楚(而不是静默只给一张)——否则用户填了 数量=2 却只拿到 1 张，完全无从判断
+    是网关只给了一张、还是被这里丢掉了。
+    """
+    if not tensors:
+        raise RuntimeError("[GPT-Image] 没有解析出任何图片。")
     if len(tensors) == 1:
         return tensors[0]
     if len({t.shape for t in tensors}) == 1:
         return torch.cat(tensors, dim=0)
-    print("[GPT-Image] 返回了多张不同尺寸的图片，无法合并为一个批次，仅输出第一张。")
+    shapes = ", ".join(str(tuple(t.shape[1:])) for t in tensors)
+    print("[GPT-Image] 上游返回了 %d 张但尺寸不一致(%s)，ComfyUI 批次要求同尺寸，"
+          "仅输出第一张。可把「宽/高」设为固定值以避免。" % (len(tensors), shapes))
     return tensors[0]
 
 
