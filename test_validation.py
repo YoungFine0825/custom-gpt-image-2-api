@@ -345,6 +345,61 @@ def main():
     assert "response_format" not in ac.build_params("gpt-image-2", "x",
                                                    response_format="default")
 
+    # ── 凭据解析：配置节点连线 > 本地配置文件（免连线兜底）──
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+
+    # 1) 无配置节点 + 无配置文件 -> 报错，提示两条路
+    no_cfg = _os.path.join(_tempfile.mkdtemp(prefix="gptimg-test-"), "local_config.json")
+    orig_path = ac._config_file_path
+    ac._config_file_path = lambda: no_cfg
+    try:
+        try:
+            ac.resolve_credentials(None)
+            raise AssertionError("期望 resolve_credentials(None) 无文件时报错")
+        except ValueError as e:
+            assert "local_config.json" in str(e), e
+    finally:
+        ac._config_file_path = orig_path
+
+    # 2) 配置文件 -> 读到 (base_url, api_key)，尾斜杠被归一
+    tmp = _tempfile.mkdtemp(prefix="gptimg-test-")
+    cfg = _os.path.join(tmp, "local_config.json")
+    with open(cfg, "w", encoding="utf-8") as f:
+        _json.dump({"base_url": "https://gw.example.com/v1/", "api_key": "sk-test"}, f)
+    base, key = ac.load_file_config(cfg)
+    assert base == "https://gw.example.com/v1", base
+    assert key == "sk-test", key
+
+    # 3) 配置文件损坏 / 缺字段 -> 返回 None 不抛
+    with open(cfg, "w", encoding="utf-8") as f:
+        f.write("{ not json")
+    assert ac.load_file_config(cfg) is None
+    with open(cfg, "w", encoding="utf-8") as f:
+        _json.dump({"base_url": "https://gw.example.com/v1"}, f)
+    assert ac.load_file_config(cfg) is None
+
+    # 4) 配置节点优先于文件；无连线时落回文件
+    with open(cfg, "w", encoding="utf-8") as f:
+        _json.dump({"base_url": "https://file.example.com/v1", "api_key": "sk-file"}, f)
+    orig_path = ac._config_file_path
+    ac._config_file_path = lambda: cfg
+    try:
+        b, k = ac.resolve_credentials(("https://node.example.com/v1", "sk-node"))
+        assert (b, k) == ("https://node.example.com/v1", "sk-node")
+        b, k = ac.resolve_credentials(None)
+        assert (b, k) == ("https://file.example.com/v1", "sk-file")
+    finally:
+        ac._config_file_path = orig_path
+
+    # 5) 校验与配置节点共用：非法地址同样报错
+    try:
+        ac.validate_credentials("ftp://x", "k")
+        raise AssertionError("期望非 http(s) 地址报错")
+    except ValueError as e:
+        assert "http" in str(e), e
+
     print("ALL PASS")
 
 

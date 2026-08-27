@@ -5,7 +5,8 @@
   - GPT-Image 生成 (Generate) -> POST {base}/images/generations (文生图)
   - GPT-Image 编辑 (Edit)     -> POST {base}/images/edits        (图生图/多参考图)
 
-接口地址与密钥来自「GPT-Image API 配置」节点，本文件不含任何预设网关。
+接口地址与密钥来自「GPT-Image API 配置」节点连线；**未连线时**自动回退到
+插件根目录的 local_config.json（免连线模式，配一次全插件生效）。本文件不含任何预设网关。
 """
 from . import api_client
 
@@ -95,7 +96,7 @@ class GPTImageGenerate:
     IS_CHANGED = staticmethod(_always_run)  # API 生图不确定，禁用输出缓存
 
     def generate(self, **kw):
-        base_url, api_key = api_client.unpack_config(kw.get("配置"))
+        base_url, api_key = api_client.resolve_credentials(kw.get("配置"))
         params = api_client.build_params(
             model=kw.get("模型", "gpt-image-2"),
             prompt=kw.get("提示词", ""),
@@ -154,7 +155,7 @@ class GPTImageEdit:
     IS_CHANGED = staticmethod(_always_run)  # API 生图不确定，禁用输出缓存
 
     def edit(self, **kw):
-        base_url, api_key = api_client.unpack_config(kw.get("配置"))
+        base_url, api_key = api_client.resolve_credentials(kw.get("配置"))
         refs = [kw.get("图片%d" % i) for i in range(1, 9)]
         ref_pngs = api_client.collect_ref_pngs(refs)
         mask = kw.get("遮罩")

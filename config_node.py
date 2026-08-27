@@ -11,6 +11,9 @@
 """
 
 
+from . import api_client
+
+
 class ImageAPIConfig:
     """GPT-Image API 配置：自定义 base_url + api_key。"""
 
@@ -38,13 +41,8 @@ class ImageAPIConfig:
     CATEGORY = "GPT-Image"
 
     def build(self, **kw):
-        base_url = (kw.get("接口地址") or "").strip().rstrip("/")
-        api_key = (kw.get("密钥") or "").strip()
-        if not base_url:
-            raise ValueError("[GPT-Image] 接口地址(base_url) 不能为空，请填写你自己的 API 地址，"
-                             "例如 https://your-endpoint.example.com/v1")
-        if not (base_url.startswith("http://") or base_url.startswith("https://")):
-            raise ValueError("[GPT-Image] 接口地址必须以 http:// 或 https:// 开头。")
-        if not api_key:
-            raise ValueError("[GPT-Image] 密钥(api_key) 不能为空。")
+        # 校验逻辑在 api_client.validate_credentials（与本地配置文件共用，
+        # 保证「配置节点连线」与「免连线配置文件」两条路行为一致）。
+        base_url, api_key = api_client.validate_credentials(
+            kw.get("接口地址"), kw.get("密钥"))
         return ((base_url, api_key),)

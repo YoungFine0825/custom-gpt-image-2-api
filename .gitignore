@@ -15,6 +15,9 @@ venv/
 test_output.png
 nerapi_test_output.png
 
+# 本地凭据配置（免连线模式，勿提交）
+local_config.json
+
 # 系统
 .DS_Store
 Thumbs.db

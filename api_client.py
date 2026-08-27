@@ -321,6 +321,82 @@ def unpack_config(config):
     return config[0], config[1]
 
 
+# ── 本地配置文件（免连线模式）────────────────────────────────────────
+# 生成/编辑节点**未连**「配置」输入时，自动从这里读 (base_url, api_key)：
+# 配一次、全插件生效，不用每个节点都去连「GPT-Image API 配置」节点。
+# 文件名带 local_ 前缀并写入 .gitignore，明确「本机私有、不进版本库、
+# 不随工作流分享」。校验与配置节点共用 validate_credentials，两条路行为一致。
+FILE_CONFIG_NAME = "local_config.json"
+
+
+def _config_file_path():
+    """配置文件路径：插件根目录（以本文件所在目录为基准，不依赖 cwd）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), FILE_CONFIG_NAME)
+
+
+def validate_credentials(base_url, api_key):
+    """校验 (base_url, api_key) 并归一化；非法抛 ValueError。
+
+    配置节点 (config_node.build) 与本地配置文件共用这一个校验入口，
+    保证「配置节点连线」和「免连线配置文件」两条路行为一致。
+    """
+    base_url = (base_url or "").strip().rstrip("/")
+    api_key = (api_key or "").strip()
+    if not base_url:
+        raise ValueError("[GPT-Image] 接口地址(base_url) 不能为空，请填写你自己的 API 地址，"
+                         "例如 https://your-endpoint.example.com/v1")
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        raise ValueError("[GPT-Image] 接口地址必须以 http:// 或 https:// 开头。")
+    if not api_key:
+        raise ValueError("[GPT-Image] 密钥(api_key) 不能为空。")
+    return base_url, api_key
+
+
+def load_file_config(path=None):
+    """从 local_config.json 读取 (base_url, api_key)；没有/读不了返回 None。
+
+    每次调用实时读文件：改配置即生效，无需重启 ComfyUI。文件不存在、JSON
+    损坏、缺字段都只打印警告并返回 None——绝不抛异常拖垮节点，之后由
+    resolve_credentials 给出明确的中文报错。path 参数仅供测试注入。
+    """
+    p = path or _config_file_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base_url = (data.get("base_url") or "").strip().rstrip("/")
+        api_key = (data.get("api_key") or "").strip()
+        if not base_url or not api_key:
+            print("[GPT-Image] 配置文件 %s 缺少 base_url 或 api_key，已忽略。" % p)
+            return None
+        return base_url, api_key
+    except ValueError as e:          # JSON 语法错误
+        print("[GPT-Image] 配置文件 %s 解析失败(JSON 损坏?): %s，已忽略。" % (p, e))
+        return None
+    except OSError as e:             # 读不到
+        print("[GPT-Image] 无法读取配置文件 %s: %s，已忽略。" % (p, e))
+        return None
+
+
+def resolve_credentials(config):
+    """解析节点凭据：优先「配置」节点连线，其次本地配置文件，都没有则报错。
+
+    返回 (base_url, api_key)。显式连线 > 配置文件：连了「配置」节点就完全用
+    配置节点的值，配置文件只做免连线兜底——旧工作流行为不受任何影响。
+    """
+    if config:
+        return unpack_config(config)
+    file_cfg = load_file_config()
+    if file_cfg:
+        return file_cfg
+    raise ValueError(
+        "[GPT-Image] 未提供 API 凭据，请二选一：\n"
+        "  ① 连接「GPT-Image API 配置」节点到「配置」输入；\n"
+        "  ② 在插件目录创建 %s 填写 base_url 与 api_key（免连线，配一次全插件生效）。"
+        % _config_file_path())
+
+
 def _parse_size(size):
     """"宽x高" -> (w, h)；不匹配返回 None（含 "auto"）。"""
     s = _clean(size)
