@@ -78,7 +78,6 @@ class GPTImageGenerate:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "配置": ("IMAGE_API_CONFIG",),
                 "提示词": ("STRING", {"default": "", "multiline": True}),
                 "模型": ("STRING", {"default": "gpt-image-2"}),
                 # 宽/高 均为 0 表示 auto（服务端自动定尺寸）；
@@ -86,7 +85,15 @@ class GPTImageGenerate:
                 "宽": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 16}),
                 "高": ("INT", {"default": 0, "min": 0, "max": 3840, "step": 16}),
             },
-            "optional": _common_optional(),
+            # 「配置」输入可选(免连线模式)：连「GPT-Image API 配置」节点用它，
+            # 不连则回退 local_config.json。v3.6.1 起才真正可选——v3.6.0 时它在
+            # required 段，ComfyUI 前端会因未连线直接拒绝执行(Required input is
+            # missing)，后端文件回退根本走不到。IMAGE_API_CONFIG 是连线端口、不产生
+            # widget，放 optional 不影响 widget 顺序(见 CLAUDE.md 不变量 4)。
+            "optional": {
+                "配置": ("IMAGE_API_CONFIG",),
+                **_common_optional(),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -125,6 +132,9 @@ class GPTImageEdit:
     @classmethod
     def INPUT_TYPES(cls):
         opt = {}
+        # 「配置」输入可选(免连线模式)：连配置节点用它，不连走 local_config.json。
+        # IMAGE_API_CONFIG 是连线端口、不产生 widget，放这里不影响 widget 顺序。
+        opt["配置"] = ("IMAGE_API_CONFIG",)
         for i in range(2, 9):  # 图片1 为必填，图片2~8 可选
             opt["图片%d" % i] = ("IMAGE",)
         opt["遮罩"] = ("MASK",)  # 可选；透明(选中)区域会被编辑
@@ -137,7 +147,6 @@ class GPTImageEdit:
         opt.update(_common_optional())
         return {
             "required": {
-                "配置": ("IMAGE_API_CONFIG",),
                 "提示词": ("STRING", {"default": "", "multiline": True}),
                 "模型": ("STRING", {"default": "gpt-image-2"}),
                 # 宽/高 均为 0 表示 auto；edits 端常见 1024x1024 / 1536x1024 / 1024x1536。

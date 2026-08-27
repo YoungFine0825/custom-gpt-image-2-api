@@ -8,6 +8,7 @@
 
 import base64
 import http.client
+import sys
 
 import requests
 import torch
@@ -399,6 +400,30 @@ def main():
         raise AssertionError("期望非 http(s) 地址报错")
     except ValueError as e:
         assert "http" in str(e), e
+
+    # 6) 免连线模式的 UI 前提：两个节点的 INPUT_TYPES 里「配置」必须是 optional。
+    #    required 段会让 ComfyUI 前端在未连线时直接拒绝执行(Required input is
+    #    missing)，后端 resolve_credentials 的文件回退根本走不到——v3.6.0 的坑，
+    #    v3.6.1 修复(见 docs/usage-and-security.md 免连线模式)。
+    import importlib.util as _ilu
+    import types as _types
+    _repo = _os.path.dirname(_os.path.abspath(__file__))
+    _pkg = _types.ModuleType("_gptimg_pkg")
+    _pkg.__path__ = [_repo]
+    sys.modules.setdefault("_gptimg_pkg", _pkg)
+    sys.modules["_gptimg_pkg.api_client"] = ac   # 复用已导入的 api_client
+    _spec = _ilu.spec_from_file_location(
+        "_gptimg_pkg.nodes_gpt_image", _os.path.join(_repo, "nodes_gpt_image.py"))
+    _nodes = _ilu.module_from_spec(_spec)
+    sys.modules["_gptimg_pkg.nodes_gpt_image"] = _nodes
+    _spec.loader.exec_module(_nodes)
+    for _cls in (_nodes.GPTImageGenerate, _nodes.GPTImageEdit):
+        _it = _cls.INPUT_TYPES()
+        assert "配置" not in _it["required"], \
+            "%s: 「配置」在 required 段会强制连线，免连线(local_config.json)不可用" % _cls.__name__
+        assert "配置" in _it.get("optional", {}), \
+            "%s: 「配置」应在 optional 段" % _cls.__name__
+    print("[OK] 生成/编辑节点「配置」输入均为 optional，免连线模式可用")
 
     print("ALL PASS")
 
