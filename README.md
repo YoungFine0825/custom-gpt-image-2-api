@@ -1,6 +1,25 @@
-# custom-gpt-image-2-api
+
+## Changed 2026-8-27
+### 免连线模式(可选):本地配置文件
+
+不想每个节点都连「配置」节点?在插件根目录(`custom_nodes/custom-gpt-image-2-api/`)创建 `local_config.json`:
+
+```json
+{
+  "base_url": "https://your-endpoint.example.com/v1",
+  "api_key": "sk-..."
+}
+```
+
+之后**不连「配置」输入**的生成/编辑节点会自动读取它——配一次、全插件生效,新增节点即拖即用。优先级:**连了「配置」节点就用配置节点的值**,配置文件只做免连线兜底,旧工作流完全不受影响。
+
+- 改文件**立即生效**,无需重启 ComfyUI(每次生成时实时读取)
+- 该文件已被 `.gitignore` 忽略,不会提交进版本库;也不进工作流 `.json` / PNG 内嵌 workflow,分享工作流不会带出密钥
+- 配置节点与配置文件**二选一**即可;两个都没有时节点会报错并提示你补哪个
 
 在 ComfyUI 里用 **GPT-Image**(`gpt-image-2` 等 OpenAI 兼容图像模型)做**文生图**与**图生图/多参考图编辑**。请求走**你自己配置的 OpenAI 兼容接口**(自定义 `base_url` + `api_key`),插件本身不含任何预设网关。
+
+# custom-gpt-image-2-api
 
 ## 四个节点(分类 `GPT-Image`)
 
@@ -42,23 +61,6 @@ cd custom-gpt-image-2-api && pip install -r requirements.txt
 1. 添加 **GPT-Image API 配置** 节点,填 **接口地址**(`base_url`,通常带 `/v1`)和 **密钥**(`api_key`)。
 2. 把它的 **配置** 输出连到 **GPT-Image 生成** 或 **GPT-Image 编辑** 的 **配置** 输入。
 3. 填参数(见下表),输出「图像」接 Preview / Save Image。
-
-### 免连线模式(可选):本地配置文件
-
-不想每个节点都连「配置」节点?在插件根目录(`custom_nodes/custom-gpt-image-2-api/`)创建 `local_config.json`:
-
-```json
-{
-  "base_url": "https://your-endpoint.example.com/v1",
-  "api_key": "sk-..."
-}
-```
-
-之后**不连「配置」输入**的生成/编辑节点会自动读取它——配一次、全插件生效,新增节点即拖即用。优先级:**连了「配置」节点就用配置节点的值**,配置文件只做免连线兜底,旧工作流完全不受影响。
-
-- 改文件**立即生效**,无需重启 ComfyUI(每次生成时实时读取)
-- 该文件已被 `.gitignore` 忽略,不会提交进版本库;也不进工作流 `.json` / PNG 内嵌 workflow,分享工作流不会带出密钥
-- 配置节点与配置文件**二选一**即可;两个都没有时节点会报错并提示你补哪个
 
 ### 参数一览
 
